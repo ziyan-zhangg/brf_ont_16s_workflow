@@ -1,7 +1,4 @@
-v1.03
+v1.04
 Date: 2026-04-28
 * Skip some version numbers to make it more clear when a new version is released.
 
-v1.00
-Date: 2026-04-28
-* New: the workable workflow now can be used for filtering, demultiplexing, and count reads per cilent.

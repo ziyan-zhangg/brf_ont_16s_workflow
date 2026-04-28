@@ -3,9 +3,9 @@ $LAST_TAG = git tag --list "v*" | Sort-Object { [Version]($_.TrimStart('v')) } |
 
 if ($LAST_TAG) {
     $VER_NUM = [Version]($LAST_TAG.TrimStart("v"))
-    $NEW_VER = "v{0}.{1:00}" -f $VER_NUM.Major, ($VER_NUM.Minor + 3)
+    $NEW_VER = "v{0}.{1:00}" -f $VER_NUM.Major, ($VER_NUM.Minor + 1)
 } else {
-    $NEW_VER = "v1.00"
+    $NEW_VER = "v3.00"
 }
 
 $VER = $NEW_VER
