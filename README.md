@@ -1,188 +1,153 @@
-# ONT Amplicon Assembly Pipeline on Gadi
+# ONT 16S Workflow — BRF @ Gadi
 
-This toolkit prepares and submits ONT amplicon assembly jobs on the NCI Gadi HPC system using the [epi2me-labs/wf-amplicon](https://github.com/epi2me-labs/wf-amplicon) Nextflow pipeline.
+Pipeline for filtering, demultiplexing, and read-counting Oxford Nanopore 16S amplicon data on the NCI Gadi HPC.
 
 ---
 
-## Files
+## Overview
 
-| File | Description |
-|---|---|
-| `amplicon_prep_gadi.py` | Main Python script that generates all PBS job scripts and directory structure |
-| `amplicon_setup.qsub` | PBS launcher script that runs `amplicon_prep_gadi.py` on Gadi |
+The workflow runs in three stages inside a single PBS job:
+
+| Stage | Tool | What it does |
+|-------|------|--------------|
+| Pre-step | `generate_primer_setup.py` | Converts a sample sheet CSV into a Minibar primer file |
+| Step 1 | Chopper | Quality- and length-filters raw reads (Q ≥ 15, 1–2 kb) |
+| Step 2 | Minibar | Demultiplexes filtered reads per sample, merges across flow-cell files |
+| Step 3 | bash | Organises output by client, generates read-count summaries |
+
+---
+
+## Repository contents
+
+```
+Filter_Chopper_Demux_Minibar.qsub   # Main PBS job script
+generate_primer_setup.py            # Primer setup file generator
+changelog.txt                       # Version history
+```
 
 ---
 
 ## Prerequisites
 
-### One-time setup (login node only)
+All tools are expected to be present under `/g/data/vz35/ONT_16s_workflow/`:
 
-These steps only need to be done once. Gadi compute nodes have no internet access, so all tools and containers must be pre-cached.
-
-**1. Install Nextflow binary**
-```bash
-module load java/jdk-17.0.2
-cd /g/data/vz35/amplicon_gadi
-curl https://get.nextflow.io | bash
-```
-
-**2. Set environment and pull the pipeline**
-```bash
-module load java/jdk-17.0.2
-export PATH=/g/data/vz35/amplicon_gadi:$PATH
-export NXF_HOME=/g/data/vz35/amplicon_gadi
-export NXF_VER=23.10.1
-export NXF_DISABLE_CHECK_LATEST=true
-export SINGULARITY_CACHEDIR=/g/data/vz35/amplicon_gadi/singularity_cache
-export NXF_SINGULARITY_CACHEDIR=$SINGULARITY_CACHEDIR
-
-nextflow pull epi2me-labs/wf-amplicon -r v1.2.2
-```
-
-**3. Pre-pull Singularity containers**
-
-Run the pipeline once on the login node (it will fail due to memory limits but will cache the containers):
-```bash
-module load singularity
-nextflow run epi2me-labs/wf-amplicon -r v1.2.2 \
-  --fastq <your_fastq_dir> \
-  --out_dir <output_dir> \
-  --sample_sheet <sample_sheet.csv> \
-  -profile singularity
-```
-
-Any containers not pulled automatically can be pulled manually:
-```bash
-singularity pull \
-  --name ontresearch-medaka-sha<hash>.img \
-  docker://ontresearch/medaka:sha<hash>
-
-# Move to cache directory
-mv ontresearch-medaka-sha<hash>.img /g/data/vz35/amplicon_gadi/singularity_cache/
-```
+| Tool | Default path |
+|------|-------------|
+| Python 3.12 | via `module load python3/3.12.1` |
+| Chopper | `/g/data/vz35/zpfeng/tools/chopper/chopper-linux-musl` |
+| Minibar | `/g/data/vz35/ONT_16s_workflow/tools/minibar/minibar.py` |
+| `generate_primer_setup.py` | `/g/data/vz35/ONT_16s_workflow/tools/generate_primer_setup.py` |
+| Twist 384 barcode reference | `/g/data/vz35/ONT_16s_workflow/tools/Twist_16S_384_barcode.txt` |
 
 ---
 
-## Input: Sample Sheet
+## Input files
 
-A CSV file with 3 or 4 columns (reference is optional):
+### 1. Sample sheet (CSV)
 
-```
-client,alias,barcode,reference
-Sarah_Kaines,SK48,barcode44,
-Sarah_Kaines,SK49,barcode45,
-AnotherClient,AC01,barcode01,/path/to/reference.fa
-```
+Required columns:
 
 | Column | Description |
-|---|---|
-| `client` | Client/project name — sets the output directory name |
-| `alias` | Sample alias used in output filenames (e.g. SK48) |
-| `barcode` | Barcode directory name in the PromethION data |
-| `reference` | Optional path to a reference FASTA file |
+|--------|-------------|
+| `Client` | Client name (used to organise output into subdirectories) |
+| `Sample_ID` | Sample identifier (alphanumeric, `-`, `_`; other characters are sanitised) |
+| `Barcode` | Twist 384 barcode ID matching a row in the barcode reference |
 
-Samples with a reference and samples without are handled separately — two sample sheets are generated automatically.
+Default location: `/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv`
+
+### 2. Raw reads
+
+PromethION `fastq_pass` directory located at:
+```
+/g/data/vz35/PromethION_data/sequencer_uploads/<run_name>/
+```
+
+The script finds the `fastq_pass` folder automatically.
+
+---
+
+## Configuration
+
+Edit the **Variables** section near the top of `Filter_Chopper_Demux_Minibar.qsub`:
+
+```bash
+run_name=ONT_16S_20260422          # Subdirectory under sequencer_uploads/
+samplesheet=/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv
+output_dir=/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_<date>
+```
+
+All other paths in the `DONT-CHANGE` section resolve automatically.
 
 ---
 
 ## Usage
 
-### Step 1: Edit the launcher script
-
-Open `amplicon_setup.qsub` and set the variables at the top:
+### 1. Generate the primer setup file (standalone)
 
 ```bash
-Email="your.email@anu.edu.au"
-PromData="ONT_PlasmidSeq_20260218/plasmidpool/20260218_1629_3F_PBE83525_e4822fd3"
-AmpDir="amplicon_run_20260218"
-SampleSheet="ONT_PlasmidSeq_20260218/plasmid_samplesheet_20260218.csv"
+python3 generate_primer_setup.py <samplesheet.csv> [-o OUTPUT_DIR] [-b BARCODE_FILE] [--date YYYYMMDD]
 ```
 
-### Step 2: Submit the launcher
+Writes `16S_primer_setup_<date>.txt` (tab-separated) with columns:
+`SampleID`, `FwIndex`, `FwPrimer`, `RvIndex`, `RvPrimer`
+
+### 2. Submit the full pipeline
 
 ```bash
-cd /path/to/your/working/directory
-qsub amplicon_setup.qsub
+qsub Filter_Chopper_Demux_Minibar.qsub
 ```
 
-This runs `amplicon_prep_gadi.py` which will:
-1. Scan the PromethION directory for the barcodes listed in the sample sheet
-2. Create a structured output directory under `AmpDir/`
-3. Collapse all FASTQ files per barcode into a single `.fq.gz` file
-4. Generate per-client sample sheets (with and without reference)
-5. Generate per-client PBS job scripts (`run_<client>.qsub`)
-6. Generate a top-level launcher script (`run_amplicons.sh`)
-
-### Step 3: Submit the assembly jobs
-
-```bash
-cd <AmpDir>
-./run_amplicons.sh
-```
-
-This submits a PBS job for each client.
+PBS resources requested: 2 CPUs, 10 GB RAM, 10 GB jobfs, 20 h walltime, queue `biodev`.
 
 ---
 
-## Output Directory Structure
+## Output structure
 
 ```
-AmpDir/
-├── run_amplicons.sh               # Top-level launcher — runs all client jobs
-├── ClientA_sample_sheet_noref.csv
-├── ClientA_sample_sheet_ref.csv
-├── run_ClientA.qsub               # PBS job script for ClientA
-├── ClientA/
-│   ├── barcode01/
-│   │   └── barcode01.fq.gz        # Collapsed FASTQ
-│   ├── barcode02/
-│   │   ├── barcode02.fq.gz
-│   │   └── reference/
-│   │       └── reference.fa
-│   └── output/                    # wf-amplicon results
-│       ├── SK48.final.fasta
-│       └── SK49.final.fasta
-└── ClientB/
-    └── ...
+minibar_output/ONT_16S_TBC_<date>/
+├── integrated_demultiplexing/
+│   ├── <ClientA>/
+│   │   ├── sample_<SampleID>.fastq
+│   │   └── summary.txt
+│   ├── <ClientB>/
+│   │   └── ...
+│   └── sample_Multiple_Matches.fastq
+│   └── sample_unk.fastq
+└── read_counts_summary.txt
 ```
+
+- `integrated_demultiplexing/` — demultiplexed reads merged across all flow-cell files, organised by client
+- `summary.txt` — per-client read counts
+- `read_counts_summary.txt` — overall summary: total filtered input, total demultiplexed, successfully demultiplexed, and per-sample percentages
+- Chopper filtered files and per-file Minibar subdirectories are deleted automatically after merging to save storage
 
 ---
 
-## Advanced Options
+## Minibar parameters
 
-These can be passed to `amplicon_prep_gadi.py` directly or added to `amplicon_setup.qsub`:
-
-| Option | Default | Description |
-|---|---|---|
-| `--pipeline_version` | `v1.2.2` | wf-amplicon version to use |
-| `--basecaller_cfg` | None | Override basecaller e.g. `dna_r10.4.1_e8.2_400bps_sup@v5.0.0` |
-| `--no_collapse` | False | Disable collapsing FASTQs into a single file per barcode |
-| `--overwrite` | False | Overwrite existing output directory |
-| `--nodata` | False | Dry run — generate scripts only, don't copy files |
-| `-v` / `--verbose` | False | Print more detail during setup |
-
-Example with basecaller override:
-```bash
-python3 amplicon_prep_gadi.py \
-  -s samplesheet.csv \
-  -p amplicon_run_20260218 \
-  -e your.email@anu.edu.au \
-  --basecaller_cfg dna_r10.4.1_e8.2_400bps_sup@v5.0.0 \
-  ONT_PlasmidSeq_20260218/plasmidpool/20260218_1629_3F_PBE83525_e4822fd3
-```
+| Flag | Value | Meaning |
+|------|-------|---------|
+| `-e 1` | 1 | Allowed errors in barcode |
+| `-E 5` | 5 | Allowed errors in primer |
+| `-l 200` | 200 | Search window length (bp) |
+| `-M 2` | 2 | Match barcodes on both ends |
+| `-T` | — | Trim barcode and primer from output |
+| `-F` | — | Write each sample to its own file |
 
 ---
 
-## Troubleshooting
+## Chopper parameters
 
-**`curl: (7) Failed to connect to www.nextflow.io`**
-The system `nextflow` module tries to download from the internet on compute nodes. Make sure you are using the local binary at `/g/data/vz35/amplicon_gadi/nextflow` and not loading the `nextflow` module.
+Reads passing all three filters are kept:
 
-**`Cannot find epi2me-labs/wf-amplicon`**
-The pipeline cache was not found. Re-run `nextflow pull epi2me-labs/wf-amplicon -r v1.2.2` on the login node with `NXF_HOME=/g/data/vz35/amplicon_gadi` set.
+- Quality score ≥ 15
+- Length ≥ 1,000 bp
+- Length ≤ 2,000 bp
 
-**`Failed to pull singularity image ... network is unreachable`**
-A Singularity container is missing from the cache. Pull it manually on the login node (see Prerequisites step 3).
+---
 
-**Job name in error files hard to read**
-PBS error files are named `ampln_asm_<ClientName>.e<jobid>` — the client name is included automatically.
+## Contact
+
+Bioinformatics Resource Facility (BRF), Australian National University
+PBS project: `vz35`
+Email notifications: ziyan.zhang@anu.edu.au

@@ -12,8 +12,7 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* Skip some version numbers to make it more clear when a new version is released.
-  THe first workable version is v4.00, so we start with that and skip to v5.00, v6.00, etc.
+* Add: a draft of README.md
 "@
 
 Write-Host "Using version: $VER"
