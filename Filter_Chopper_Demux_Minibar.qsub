@@ -1,0 +1,322 @@
+#!/bin/bash
+#PBS -N Chopper_Minibar_test
+#PBS -P vz35
+#PBS -l wd
+#PBS -m e
+#PBS -M ziyan.zhang@anu.edu.au
+#PBS -l ncpus=2
+#PBS -l mem=10GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=20:00:00
+#PBS -l storage=gdata/vz35
+#PBS -q biodev
+
+#--------README---------------------------------------------------------------------------------------------
+# Combined pipeline: Generate primer file, filter reads with Chopper, then demultiplex with Minibar
+#   Pre-step      - generate_primer_setup.py: generate primer_file from samplesheet
+#   Step 1 - Chopper: filter each fastq.gz for Q >= 15, length 1kb-2kb, silently removed after finish
+#   Step 2 - Minibar: demultiplex each filtered reads, merge across files, then count reads
+
+#--------Module---------------------------------------------------------------------------------------------
+module load python3/3.12.1
+
+date_stamp=$(date +%Y%m%d)
+
+#--------Variables------------------------------------------------------------------------------------------
+# run name under /g/data/vz35/PromethION_data/sequencer_uploads/
+run_name=ONT_16S_20260422
+
+# sample sheet CSV for primer setup generation (columns: Client, Sample_ID, Barcode)
+samplesheet=/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv
+
+# demu data location, which will have integrated_demultiplexing folder and read count
+output_dir=/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_${date_stamp}
+
+#--------DONT-CHANGE----------------------------------------------------------------------------------------
+_root=/g/data/vz35/PromethION_data/sequencer_uploads
+raw_input_dir=$(find "${_root}/${run_name}" -type d -name "fastq_pass" | head -1)
+if [[ -z "$raw_input_dir" ]]; then
+    echo "ERROR: fastq_pass not found under ${_root}/${run_name}" >&2
+    exit 1
+fi
+
+filtered_dir=${output_dir}/chopper_filtered        # Chopper output -> Minibar input, will be remove afterward
+integrated_dir=${output_dir}/integrated_demultiplexing
+summary_file=${output_dir}/read_counts_summary.txt
+
+chopper_prog=/g/data/vz35/zpfeng/tools/chopper/chopper-linux-musl
+minibar_prog=/g/data/vz35/ONT_16s_workflow/tools/minibar/minibar.py
+generate_primer_script=/g/data/vz35/ONT_16s_workflow/tools/generate_primer_setup.py
+primer_output_dir=/g/data/vz35/ONT_16s_workflow/sample_sheet
+
+mkdir -p "$output_dir"
+mkdir -p "$filtered_dir"
+mkdir -p "$integrated_dir"
+
+#========================================================================================================
+# PRE-STEP: Generate primer setup file
+#========================================================================================================
+echo "========================================"
+echo " PRE-STEP: Generating primer setup: $(date)"
+echo "========================================"
+echo " Samplesheet: $samplesheet"
+
+python3 "$generate_primer_script" "$samplesheet" -o "$primer_output_dir" --date "$date_stamp"
+if [[ $? -ne 0 ]]; then
+    echo "ERROR: generate_primer_setup.py failed. Aborting." >&2
+    exit 1
+fi
+
+primer_file="${primer_output_dir}/16S_primer_setup_${date_stamp}.txt"
+echo " Primer file: $primer_file"
+echo "========================================"
+
+#========================================================================================================
+# STEP 1: Filter with Chopper
+#========================================================================================================
+echo "========================================"
+echo " STEP 1: Chopper filtering: $(date)"
+echo "========================================"
+echo " Input dir:    $raw_input_dir"
+echo " Filtered dir: $filtered_dir"
+echo ""
+
+for f in "${raw_input_dir}"/*.fastq.gz; do
+    [[ -f "$f" ]] || continue
+    sample=$(basename "$f" .fastq.gz)
+    out_file="${filtered_dir}/${sample}_filtered.fastq.gz"
+
+    echo "  Filtering: $sample"
+    echo "    Input:  $f"
+    echo "    Output: $out_file"
+    echo "    Start:  $(date)"
+
+    zcat "$f" | "$chopper_prog" -q 15 --minlength 1000 --maxlength 2000 | gzip > "$out_file"
+
+    echo "    Done:   $(date)"
+    echo ""
+done
+
+echo " Chopper filtering complete: $(date)"
+echo "========================================"
+
+#-----------Count total filtered reads (before files are deleted later)-------
+echo ""
+echo " Counting total filtered input reads: $(date)"
+total_input=0
+for input_file in "${filtered_dir}"/*.fastq.gz; do
+    [[ -f "$input_file" ]] || continue
+    lines=$(zcat "$input_file" | wc -l)
+    reads=$(( lines / 4 ))
+    echo "  $(basename $input_file): $reads reads"
+    total_input=$(( total_input + reads ))
+done
+echo " Total filtered input reads: $total_input"
+echo "========================================"
+
+#========================================================================================================
+# STEP 2: Demultiplex with Minibar
+#========================================================================================================
+echo ""
+echo "========================================"
+echo " STEP 2: Minibar demultiplexing: $(date)"
+echo "========================================"
+echo " Input dir: $filtered_dir"
+echo " Files found:"
+ls "${filtered_dir}"/*.fastq.gz
+echo ""
+
+for input_file in "${filtered_dir}"/*.fastq.gz; do
+    [[ -f "$input_file" ]] || continue
+
+    base=$(basename "$input_file" .fastq.gz)
+    outd="${output_dir}/${base}"
+    mkdir -p "$outd"
+    cd "$outd"
+
+    echo "--- Processing: $base ---"
+    echo "  Input:  $input_file"
+    echo "  Outdir: $outd"
+    echo "  Start:  $(date)"
+
+    python3 "$minibar_prog" \
+        -e 1 \
+        -E 5 \
+        -l 200 \
+        -M 2 \
+        -T \
+        -F \
+        "$primer_file" \
+        "$input_file"
+
+    # -e  allowed errors in barcode
+    # -E  allowed errors in primer
+    # -l  search window length
+    # -M  match barcodes on both ends
+    # -T  trim barcode and primer from output sequences
+    # -F  write each sample to individual files
+
+    echo "  Done:   $(date)"
+    echo ""
+done
+
+echo " All files demultiplexed: $(date)"
+echo "========================================"
+
+#-----------Merge across all per-file subdirectories--------------------------
+echo ""
+echo "========================================"
+echo " Merging outputs: $(date)"
+echo "========================================"
+
+all_samples=$(find "$output_dir" -maxdepth 2 -name "sample_*.fastq" \
+    ! -path "$integrated_dir/*" -exec basename {} \; | sort -u)
+
+for tmp in $all_samples; do
+    echo "  Merging: $tmp"
+    for subdir in "${output_dir}"/*/; do
+        [[ "$subdir" == "${integrated_dir}/" ]] && continue
+        [[ "$subdir" == "${filtered_dir}/" ]]   && continue
+        src="${subdir}${tmp}"
+        [[ -f "$src" ]] && cat "$src" >> "${integrated_dir}/${tmp}"
+    done
+done
+
+echo " Merging complete: $(date)"
+echo "========================================"
+
+#-----------Remove per-file subdirectories after merging----------------------
+echo ""
+echo "========================================"
+echo " Cleaning up per-file subdirectories: $(date)"
+echo "========================================"
+
+for subdir in "${output_dir}"/*/; do
+    [[ "$subdir" == "${integrated_dir}/" ]] && continue
+    [[ "$subdir" == "${filtered_dir}/" ]]   && continue
+    echo "  Removing: $subdir"
+    rm -rf "$subdir"
+done
+
+echo " Cleanup complete: $(date)"
+echo "========================================"
+
+#-----------Delete Chopper filtered files to save space-----------------------
+echo ""
+echo "========================================"
+echo " Deleting Chopper filtered files: $(date)"
+echo "========================================"
+
+rm -rf "$filtered_dir"
+echo " Deleted: $filtered_dir"
+echo " Cleanup complete: $(date)"
+echo "========================================"
+
+#========================================================================================================
+# STEP 3: Organise demultiplexed reads by client
+#========================================================================================================
+echo ""
+echo "========================================"
+echo " STEP 3: Organising reads by client: $(date)"
+echo "========================================"
+
+awk -F',' 'NR>1 && $1!="" && $2!="" {
+    client=$1; sid=$2
+    gsub(/[^A-Za-z0-9._-]/, "_", client)
+    print client "\t" sid
+}' "$samplesheet" | while IFS=$'\t' read -r client_dir sample_id; do
+    mkdir -p "${integrated_dir}/${client_dir}"
+    src="${integrated_dir}/sample_${sample_id}.fastq"
+    if [[ -f "$src" ]]; then
+        mv "$src" "${integrated_dir}/${client_dir}/"
+        echo "  Moved: sample_${sample_id}.fastq -> ${client_dir}/"
+    else
+        echo "  WARNING: sample_${sample_id}.fastq not found"
+    fi
+done
+
+echo ""
+echo " Generating per-client summaries..."
+for client_subdir in "${integrated_dir}"/*/; do
+    [[ -d "$client_subdir" ]] || continue
+    client_name=$(basename "$client_subdir")
+    summary="${client_subdir}summary.txt"
+
+    client_total=0
+    for fastq in "${client_subdir}"sample_*.fastq; do
+        [[ -f "$fastq" ]] || continue
+        client_total=$(( client_total + $(wc -l < "$fastq") / 4 ))
+    done
+
+    {
+        echo "========================================"
+        echo " Client: $client_name"
+        echo " Date:   $(date)"
+        echo "========================================"
+        printf "%-40s %10s\n" "Sample" "Reads"
+        echo "----------------------------------------"
+        for fastq in "${client_subdir}"sample_*.fastq; do
+            [[ -f "$fastq" ]] || continue
+            sample=$(basename "$fastq" .fastq)
+            reads=$(( $(wc -l < "$fastq") / 4 ))
+            printf "%-40s %10d\n" "$sample" "$reads"
+        done
+        echo "----------------------------------------"
+        printf "%-40s %10d\n" "CLIENT TOTAL" "$client_total"
+        echo "========================================"
+    } | tee "$summary"
+    echo "  Saved: $summary"
+    echo ""
+done
+
+echo " Organisation complete: $(date)"
+echo "========================================"
+
+#-----------Read count summary------------------------------------------------
+echo ""
+echo "========================================"
+echo " Generating read count summary: $(date)"
+echo "========================================"
+
+{
+echo "========================================"
+echo " Minibar Demultiplexing Read Count Summary"
+echo " Raw input dir:     $raw_input_dir"
+echo " Filtered dir:      $filtered_dir"
+echo " Out dir:           $output_dir"
+echo " Date:              $(date)"
+echo "========================================"
+printf "%-40s %10s %10s\n" "Sample" "Reads" "% of Input"
+echo "----------------------------------------"
+
+total_demux=0
+multi_match_reads=0
+unk_reads=0
+
+for fastq in "${integrated_dir}"/sample_*.fastq "${integrated_dir}"/*/sample_*.fastq; do
+    [[ -f "$fastq" ]] || continue
+    sample=$(basename "$fastq" .fastq)
+    lines=$(wc -l < "$fastq")
+    reads=$(( lines / 4 ))
+    pct=$(awk "BEGIN {printf \"%.2f\", $reads/$total_input*100}")
+    printf "%-40s %10d %9s%%\n" "$sample" "$reads" "$pct"
+    total_demux=$(( total_demux + reads ))
+    [[ "$sample" == "sample_Multiple_Matches" ]] && multi_match_reads=$reads
+    [[ "$sample" == "sample_unk" ]]              && unk_reads=$reads
+done
+
+success_reads=$(( total_input - multi_match_reads - unk_reads ))
+success_pct=$(awk "BEGIN {printf \"%.2f\", $success_reads/$total_input*100}")
+total_pct=$(awk   "BEGIN {printf \"%.2f\", $total_demux/$total_input*100}")
+
+echo "----------------------------------------"
+printf "%-40s %10d %9s%%\n" "TOTAL DEMULTIPLEXED"        "$total_demux"   "$total_pct"
+printf "%-40s %10d %9s%%\n" "SUCCESSFULLY DEMULTIPLEXED" "$success_reads" "$success_pct"
+printf "%-40s %10d %9s%%\n" "TOTAL FILTERED INPUT"       "$total_input"   "100.00"
+echo "========================================"
+} | tee "$summary_file"
+
+echo ""
+echo " Summary saved to: $summary_file"
+echo " Pipeline complete: $(date)"
+echo "========================================"

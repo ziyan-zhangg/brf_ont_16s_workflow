@@ -1,32 +1,7 @@
-v2.06
-Date: 2026-04-17
-* Fix: now prep script will look into fastq_pass and fastq_fail folders for fastq files, instead of looking into the root folder. 
-  This is to accomodate the strict filtering applied for plasmid.
+v1.00
+Date: 2026-04-28
+* New: the workable workflow now can be used for filtering, demultiplexing, and count reads per cilent.
 
-v2.05
-Date: 2026-04-17
-* New: Just a polish for tag and push script
-
-v2.03
-Date: 17/04/2026 2:02:20 PM
-* New: CLean up folder available only at Gadi.
-
-v2.03
-Date: 17/04/2026 1:38:37 PM
-* New: CLean up folder available only at Gadi.
-
-v2.02
-Date: 17/04/2026 1:36:15 PM
-* New: A draft README added.
-
-v2.02
-Date: 14/04/2026 4:12:07 PM
-* New: A draft README added.
-
-v2.01
-Date: 14/04/2026 4:04:22 PM
-* New: A functional workflow assembling PCR product/Amplicon for BRF
-
-v2.01
+v3.00
 Date: 14/04/2026 3:55:57 PM
-* New: A functional workflow assembling PCR product/Amplicon for BRF
+* New: A draft for 16s ONT workflow
