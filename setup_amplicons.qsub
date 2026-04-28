@@ -1,0 +1,31 @@
+#!/bin/bash
+
+#PBS -N amplicon_setup
+#PBS -P vz35
+#PBS -l mem=4GB,ncpus=2,walltime=2:00:00
+#PBS -q biodev
+#PBS -l storage=gdata/vz35
+#PBS -m abe
+#PBS -M ziyan.zhang@anu.edu.au
+#PBS -l wd
+
+# You need to qsub this file from wherever the plasmid assembly folder is located. 
+
+### Set these variables and launch with qsub ###
+
+# Email is your email address to get Gadi job messages
+Email="ziyan.zhang@anu.edu.au"
+
+# PromData is the path to the PromethION run containing the amplicons
+PromData="ONT_PlasmidSeq_20260218/plasmidpool/20260218_1629_3F_PBE83525_e4822fd3"
+
+# AmpDir is the name of the directory you want to put the amplicon assemblies in
+AmpDir="plastest1"
+
+# SampleSheet is the path to the sample sheet that describes the amplicon samples, users, amplicon length, and any reference. You make this file!
+SampleSheet="ONT_PlasmidSeq_20260218/plasmid_samplesheet_20260218.csv"
+
+### Commands below, add --nodata if you already copied the files, but just want new scripts to be generated
+
+module load python3
+python3 amplicon_prep_gadi_v2.py -s "${SampleSheet}" -p "${AmpDir}" -e "${Email}" "${PromData}"
