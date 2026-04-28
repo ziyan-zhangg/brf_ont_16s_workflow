@@ -1,7 +1,7 @@
+v1.03
+Date: 2026-04-28
+* Skip some version numbers to make it more clear when a new version is released.
+
 v1.00
 Date: 2026-04-28
 * New: the workable workflow now can be used for filtering, demultiplexing, and count reads per cilent.
-
-v3.00
-Date: 14/04/2026 3:55:57 PM
-* New: A draft for 16s ONT workflow

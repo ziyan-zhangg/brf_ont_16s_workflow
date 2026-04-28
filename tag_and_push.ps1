@@ -3,7 +3,7 @@ $LAST_TAG = git tag --list "v*" | Sort-Object { [Version]($_.TrimStart('v')) } |
 
 if ($LAST_TAG) {
     $VER_NUM = [Version]($LAST_TAG.TrimStart("v"))
-    $NEW_VER = "v{0}.{1:00}" -f $VER_NUM.Major, ($VER_NUM.Minor + 1)
+    $NEW_VER = "v{0}.{1:00}" -f $VER_NUM.Major, ($VER_NUM.Minor + 3)
 } else {
     $NEW_VER = "v1.00"
 }
@@ -12,7 +12,7 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* New: the workable workflow now can be used for filtering, demultiplexing, and count reads per cilent.
+* Skip some version numbers to make it more clear when a new version is released.
 "@
 
 Write-Host "Using version: $VER"
