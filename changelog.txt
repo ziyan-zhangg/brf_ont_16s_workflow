@@ -1,4 +1,5 @@
-v1.04
+v4.01
 Date: 2026-04-28
 * Skip some version numbers to make it more clear when a new version is released.
+  THe first workable version is v4.00, so we start with that and skip to v5.00, v6.00, etc.
 

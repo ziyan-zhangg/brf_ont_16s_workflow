@@ -5,7 +5,7 @@ if ($LAST_TAG) {
     $VER_NUM = [Version]($LAST_TAG.TrimStart("v"))
     $NEW_VER = "v{0}.{1:00}" -f $VER_NUM.Major, ($VER_NUM.Minor + 1)
 } else {
-    $NEW_VER = "v3.00"
+    $NEW_VER = "v1.00"
 }
 
 $VER = $NEW_VER
@@ -13,6 +13,7 @@ $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
 * Skip some version numbers to make it more clear when a new version is released.
+  THe first workable version is v4.00, so we start with that and skip to v5.00, v6.00, etc.
 "@
 
 Write-Host "Using version: $VER"
