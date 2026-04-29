@@ -12,7 +12,9 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* Add: a draft of README.md
+* Change: Remove trimming from workflow, as it is necessary for further QC.
+  minibar -T is removed.
+
 "@
 
 Write-Host "Using version: $VER"

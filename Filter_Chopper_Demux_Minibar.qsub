@@ -144,7 +144,6 @@ for input_file in "${filtered_dir}"/*.fastq.gz; do
         -E 5 \
         -l 200 \
         -M 2 \
-        -T \
         -F \
         "$primer_file" \
         "$input_file"
@@ -153,7 +152,6 @@ for input_file in "${filtered_dir}"/*.fastq.gz; do
     # -E  allowed errors in primer
     # -l  search window length
     # -M  match barcodes on both ends
-    # -T  trim barcode and primer from output sequences
     # -F  write each sample to individual files
 
     echo "  Done:   $(date)"

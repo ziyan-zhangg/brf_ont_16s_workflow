@@ -1,3 +1,9 @@
+v4.03
+Date: 2026-04-29
+* Change: Remove trimming from workflow, as it is necessary for further QC.
+  minibar -T is removed.
+
+
 v4.02
 Date: 2026-04-28
 * Add: a draft of README.md
