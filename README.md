@@ -13,7 +13,7 @@ The workflow runs in three stages inside a single PBS job:
 | Pre-step | `generate_primer_setup.py` | Converts a sample sheet CSV into a Minibar primer file |
 | Step 1 | Chopper | Quality- and length-filters raw reads (Q ≥ 15, 1–2 kb) |
 | Step 2 | Minibar | Demultiplexes filtered reads per sample, merges across flow-cell files |
-| Step 3 | bash | Organises output by client, generates read-count summaries |
+| Step 3 | Sort and count | Organises output by client, generates read-count summaries |
 
 ---
 
@@ -53,7 +53,9 @@ Required columns:
 | `Sample_ID` | Sample identifier (alphanumeric, `-`, `_`; other characters are sanitised) |
 | `Barcode` | Twist 384 barcode ID matching a row in the barcode reference |
 
-Default location: `/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv`
+Sample sheet corresponds barcode info
+
+---
 
 ### 2. Raw reads
 
@@ -116,10 +118,10 @@ minibar_output/ONT_16S_TBC_<date>/
 └── read_counts_summary.txt
 ```
 
-- `integrated_demultiplexing/` — demultiplexed reads merged across all flow-cell files, organised by client
+- `integrated_demultiplexing/` — demultiplexed reads merged across all fastq.gz files under fastq_pass
 - `summary.txt` — per-client read counts
 - `read_counts_summary.txt` — overall summary: total filtered input, total demultiplexed, successfully demultiplexed, and per-sample percentages
-- Chopper filtered files and per-file Minibar subdirectories are deleted automatically after merging to save storage
+- Chopper filtered reads and per-file Minibar subdirectories are deleted automatically after merging to save storage
 
 ---
 
@@ -145,9 +147,3 @@ Reads passing all three filters are kept:
 - Length ≤ 2,000 bp
 
 ---
-
-## Contact
-
-Bioinformatics Resource Facility (BRF), Australian National University
-PBS project: `vz35`
-Email notifications: ziyan.zhang@anu.edu.au
