@@ -22,7 +22,6 @@ The workflow runs in three stages inside a single PBS job:
 ```
 Filter_Chopper_Demux_Minibar.qsub   # Main PBS job script
 generate_primer_setup.py            # Primer setup file generator
-changelog.txt                       # Version history
 ```
 
 ---
@@ -34,8 +33,8 @@ All tools are expected to be present under `/g/data/vz35/ONT_16s_workflow/`:
 | Tool | Default path |
 |------|-------------|
 | Python 3.12 | via `module load python3/3.12.1` |
-| Chopper | `/g/data/vz35/zpfeng/tools/chopper/chopper-linux-musl` |
-| Minibar | `/g/data/vz35/ONT_16s_workflow/tools/minibar/minibar.py` |
+| ./Chopper | `/g/data/vz35/zpfeng/tools/chopper/chopper-linux-musl` |
+| ./Minibar | `/g/data/vz35/ONT_16s_workflow/tools/minibar/minibar.py` |
 | `generate_primer_setup.py` | `/g/data/vz35/ONT_16s_workflow/tools/generate_primer_setup.py` |
 | Twist 384 barcode reference | `/g/data/vz35/ONT_16s_workflow/tools/Twist_16S_384_barcode.txt` |
 
@@ -64,7 +63,7 @@ PromethION `fastq_pass` directory located at:
 /g/data/vz35/PromethION_data/sequencer_uploads/<run_name>/
 ```
 
-The script finds the `fastq_pass` folder automatically.
+The script finds the `fastq_pass` folder automatically when input run_name.
 
 ---
 
@@ -93,13 +92,17 @@ python3 generate_primer_setup.py <samplesheet.csv> [-o OUTPUT_DIR] [-b BARCODE_F
 Writes `16S_primer_setup_<date>.txt` (tab-separated) with columns:
 `SampleID`, `FwIndex`, `FwPrimer`, `RvIndex`, `RvPrimer`
 
-### 2. Submit the full pipeline
+Twist 384 barcode reference is the default.
+
+This can be used when using external barcodes.
+
+### 2. Edit the Variables section and submit the full pipeline
 
 ```bash
-qsub Filter_Chopper_Demux_Minibar.qsub
+qsub Filter_Chopper_Demux_Minibar.qsub # contain primer setup
 ```
 
-PBS resources requested: 2 CPUs, 10 GB RAM, 10 GB jobfs, 20 h walltime, queue `biodev`.
+PBS resources requested: 2 CPUs, 10 GB RAM, 10 GB jobfs, 20 h walltime.
 
 ---
 
@@ -117,8 +120,9 @@ minibar_output/ONT_16S_TBC_<date>/
 │   └── sample_unk.fastq
 └── read_counts_summary.txt
 ```
+- demultiplexing results under /g/data/vz35/ONT_16s_workflow/
 
-- `integrated_demultiplexing/` — demultiplexed reads merged across all fastq.gz files under fastq_pass
+- `integrated_demultiplexing/` — single ONT run generates multiple fastq.gz files, so demultiplexed reads wil be merged across all fastq.gz files under fastq_pass
 - `summary.txt` — per-client read counts
 - `read_counts_summary.txt` — overall summary: total filtered input, total demultiplexed, successfully demultiplexed, and per-sample percentages
 - Chopper filtered reads and per-file Minibar subdirectories are deleted automatically after merging to save storage
@@ -133,7 +137,6 @@ minibar_output/ONT_16S_TBC_<date>/
 | `-E 5` | 5 | Allowed errors in primer |
 | `-l 200` | 200 | Search window length (bp) |
 | `-M 2` | 2 | Match barcodes on both ends |
-| `-T` | — | Trim barcode and primer from output |
 | `-F` | — | Write each sample to its own file |
 
 ---
