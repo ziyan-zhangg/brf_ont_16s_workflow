@@ -1,0 +1,80 @@
+#!/bin/bash
+#PBS -N Chopper_Minibar
+#PBS -P vz35
+#PBS -l wd
+#PBS -m e
+#PBS -M ziyan.zhang@anu.edu.au
+#PBS -l ncpus=2
+#PBS -l mem=10GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=20:00:00
+#PBS -l storage=gdata/vz35
+#PBS -q biodev
+
+#--------README---------------------------------------------------------------
+# Slim wrapper around the Python core pipeline.
+#   Pre-step: generate_primer_setup.py  -> 16S_primer_setup_<date>.txt
+#   Core:     filter_chopper_demux_minibar.py
+#               Step 1 - Chopper filter (Q>=15, 1-2kb)
+#               Step 2 - Minibar demultiplex
+#               Step 3 - Organise reads by client + write summaries
+#-----------------------------------------------------------------------------
+
+set -euo pipefail
+
+#--------Module---------------------------------------------------------------
+module load python3/3.12.1
+
+date_stamp=$(date +%Y%m%d)
+
+#--------Variables (edit per run)---------------------------------------------
+# run name under /g/data/vz35/PromethION_data/sequencer_uploads/
+run_name=ONT_16S_20260422
+
+# sample sheet CSV (columns: Client, Sample_ID, Barcode)
+samplesheet=/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv
+
+# run output (will hold integrated_demultiplexing/ + read_counts_summary.txt)
+output_dir=/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_${date_stamp}
+
+#--------DONT-CHANGE----------------------------------------------------------
+_root=/g/data/vz35/PromethION_data/sequencer_uploads
+raw_input_dir=$(find "${_root}/${run_name}" -type d -name "fastq_pass" | head -1)
+if [[ -z "$raw_input_dir" ]]; then
+    echo "ERROR: fastq_pass not found under ${_root}/${run_name}" >&2
+    exit 1
+fi
+
+tools_dir=/g/data/vz35/ONT_16s_workflow/tools
+generate_primer_script=${tools_dir}/generate_primer_setup.py # attention to location
+core_script=${tools_dir}/filter_chopper_demux_minibar.py # attention to location
+
+primer_output_dir=/g/data/vz35/ONT_16s_workflow/sample_sheet
+primer_file="${primer_output_dir}/16S_primer_setup_${date_stamp}.txt"
+
+mkdir -p "$output_dir"
+
+#=============================================================================
+# PRE-STEP: Generate primer setup file
+#=============================================================================
+echo "========================================"
+echo " PRE-STEP: Generating primer setup: $(date)"
+echo "========================================"
+echo " Samplesheet: $samplesheet"
+
+python3 "$generate_primer_script" \
+    "$samplesheet" \
+    -o "$primer_output_dir" \
+    --date "$date_stamp"
+
+echo " Primer file: $primer_file"
+echo "========================================"
+
+#=============================================================================
+# CORE: Chopper filter -> Minibar demux -> organise by client
+#=============================================================================
+python3 "$core_script" \
+    --raw-input-dir "$raw_input_dir" \
+    --output-dir    "$output_dir" \
+    --primer-file   "$primer_file" \
+    --samplesheet   "$samplesheet"

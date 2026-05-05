@@ -1,3 +1,8 @@
+v5.00
+Date: 2026-05-05
+* Update: rewrite core functions using Python script to call Chopper and Minibar directly, and use the same script for both steps.
+          No more updates for qsub script, but will keep it for reference and backup until the new Python version is fully tested and validated.
+
 v4.04
 Date: 2026-05-05
 * Update README.md

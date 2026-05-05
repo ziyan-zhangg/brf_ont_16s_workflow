@@ -15,7 +15,12 @@
 # Combined pipeline: Generate primer file, filter reads with Chopper, then demultiplex with Minibar
 #   Pre-step      - generate_primer_setup.py: generate primer_file from samplesheet
 #   Step 1 - Chopper: filter each fastq.gz for Q >= 15, length 1kb-2kb, silently removed after finish
-#   Step 2 - Minibar: demultiplex each filtered reads, merge across files, then count reads
+#   Step 2 - Minibar: demultiplex each filtered reads, merge across files, then count reads, but keep the primer
+#   Step 3 - Organise by client: move demultiplexed reads into client subdirectories, generate per-client summaries
+#   Final output: integrated_demultiplexing/ with sample_*.fastq files, per-client subdirectories, and read count summary
+
+# Note: rewrite using Python script to call Chopper and Minibar directly at 20260505
+# No more updates for this script, but will keep it for reference and backup until the new Python version is fully tested and validated
 
 #--------Module---------------------------------------------------------------------------------------------
 module load python3/3.12.1
