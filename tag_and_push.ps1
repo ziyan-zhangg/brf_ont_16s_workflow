@@ -8,15 +8,12 @@ if ($LAST_TAG) {
     $NEW_VER = "v1.00"
 }
 
-#$VER = $NEW_VER
-
-$VER = "v5.00"
+$VER = $NEW_VER
 
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* Update: rewrite core functions using Python script to call Chopper and Minibar directly, and use the same script for both steps.
-          No more updates for qsub script, but will keep it for reference and backup until the new Python version is fully tested and validated.
+* Update: add cutadapt function to (1) normalize orientation of fastq files, and (2) trim adapter sequences from reads.
 "@
 
 Write-Host "Using version: $VER"

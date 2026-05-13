@@ -1,3 +1,7 @@
+v5.01
+Date: 2026-05-13
+* Update: add cutadapt function to (1) normalize orientation of fastq files, and (2) trim adapter sequences from reads.
+
 v5.00
 Date: 2026-05-05
 * Update: rewrite core functions using Python script to call Chopper and Minibar directly, and use the same script for both steps.

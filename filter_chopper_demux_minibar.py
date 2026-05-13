@@ -8,7 +8,12 @@ Pipeline:
     Step 1 - Chopper:    filter each fastq.gz for Q >= 15, length 1kb-2kb
     Step 2 - Minibar:    demultiplex each filtered file but keep the primer
              usage: python3 minibar.py -e 1 -E 5 -l 200 -M 2 -F
-    Step 3 - Organise:   merge per-file outputs, group by client, write summaries
+    Step 2.5 - Cutadapt: two-pass per-sample orientation + 5'/3' primer trim
+             Pass 1: -g FWD --revcomp --rename={header} --discard-untrimmed
+             Pass 2: -a REV_RC  (tolerant; keeps truncated reads)
+             Replaces sample_<SampleID>.fastq with <SampleID>.fastq.gz.
+    Step 3 - Organise:   group by client, write summaries
+    Final  - Logs:       move all *.log/*.txt logs to run_log_<date>/
 
 This script assumes the primer setup file has already been generated
 (via generate_primer_setup.py) before it is invoked. A separate qsub
@@ -40,6 +45,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+
+# Local import: two-pass cutadapt step (file lives in the same tools/ dir).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cutadapt_2pass import run_cutadapt_step, DEFAULT_CUTADAPT  # noqa: E402
 
 
 # --- Defaults (Gadi) ---------------------------------------------------------
@@ -320,17 +329,25 @@ def organise_by_client(
     for cs in samples:
         client_dir = integrated_dir / cs.client
         client_dir.mkdir(parents=True, exist_ok=True)
-        src = integrated_dir / f"sample_{cs.sample_id}.fastq"
+        # Cutadapt step renamed sample_<id>.fastq -> <id>.fastq.gz.
+        # Fall back to the pre-cutadapt name if cutadapt skipped the sample
+        # (e.g. no primers in the setup file).
+        src = integrated_dir / f"{cs.sample_id}.fastq.gz"
+        legacy = integrated_dir / f"sample_{cs.sample_id}.fastq"
         if src.is_file():
             shutil.move(str(src), str(client_dir / src.name))
-            log(f"  Moved: sample_{cs.sample_id}.fastq -> {cs.client}/")
+            log(f"  Moved: {src.name} -> {cs.client}/")
+        elif legacy.is_file():
+            shutil.move(str(legacy), str(client_dir / legacy.name))
+            log(f"  Moved (uncut): {legacy.name} -> {cs.client}/")
         else:
-            log(f"  WARNING: sample_{cs.sample_id}.fastq not found")
+            log(f"  WARNING: neither {src.name} nor {legacy.name} found")
 
     log("")
     log(" Generating per-client summaries...")
     for client_subdir in sorted(p for p in integrated_dir.iterdir() if p.is_dir()):
-        fastqs = sorted(client_subdir.glob("sample_*.fastq"))
+        fastqs = sorted(client_subdir.glob("*.fastq.gz")) \
+                 + sorted(client_subdir.glob("sample_*.fastq"))
         client_total = sum(count_fastq_reads(f) for f in fastqs)
 
         lines = [
@@ -370,10 +387,14 @@ def write_run_summary(
     log("")
     banner("Generating read count summary")
 
-    # collect all per-sample fastqs (top-level + one client level deep)
+    # collect all per-sample fastqs (top-level + one client level deep).
+    # Cutadapt step renames sample_<id>.fastq -> <id>.fastq.gz; the minibar
+    # catch-all bins (sample_unk, sample_Multiple_Matches) keep the old name.
     fastqs: list[Path] = []
     fastqs += sorted(integrated_dir.glob("sample_*.fastq"))
     fastqs += sorted(integrated_dir.glob("*/sample_*.fastq"))
+    fastqs += sorted(integrated_dir.glob("*.fastq.gz"))
+    fastqs += sorted(integrated_dir.glob("*/*.fastq.gz"))
 
     lines = [
         "========================================",
@@ -391,7 +412,8 @@ def write_run_summary(
     multi_match_reads = 0
     unk_reads = 0
     for f in fastqs:
-        sample = f.stem
+        # .fastq.gz files have suffixes ".fastq" + ".gz"; .stem strips only ".gz".
+        sample = f.name.removesuffix(".fastq.gz") if f.name.endswith(".fastq.gz") else f.stem
         reads = count_fastq_reads(f)
         pct = (reads / total_input * 100) if total_input else 0.0
         lines.append(f"{sample:<40} {reads:>10d} {pct:>9.2f}%")
@@ -443,7 +465,50 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-quality", type=int, default=15)
     p.add_argument("--min-length", type=int, default=1000)
     p.add_argument("--max-length", type=int, default=2000)
+    p.add_argument("--cutadapt", type=Path, default=DEFAULT_CUTADAPT,
+                   help=f"Path to cutadapt binary (default: {DEFAULT_CUTADAPT}).")
+    p.add_argument("--cutadapt-threads", type=int, default=4,
+                   help="Threads for cutadapt (default: 4).")
+    p.add_argument("--cutadapt-error-rate", type=float, default=0.2,
+                   help="Cutadapt error rate -e (default: 0.2).")
     return p.parse_args()
+
+
+def collect_logs(output_dir: Path) -> Path:
+    """Move all *.log and *.txt summaries into a dated run_log_<date> directory."""
+    log("")
+    banner("Collecting logs")
+    date_stamp = datetime.now().strftime("%Y%m%d")
+    log_dir = output_dir / f"run_log_{date_stamp}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    moved = 0
+    # Top-level log/summary files in output_dir
+    for pattern in ("*.log", "*.txt"):
+        for src in sorted(output_dir.glob(pattern)):
+            if src.is_file() and src.parent == output_dir:
+                dest = log_dir / src.name
+                shutil.move(str(src), str(dest))
+                moved += 1
+                log(f"  Moved: {src.name}")
+
+    # Cutadapt per-sample logs live in output_dir/cutadapt_logs/
+    cutadapt_logs = output_dir / "cutadapt_logs"
+    if cutadapt_logs.is_dir():
+        dest = log_dir / cutadapt_logs.name
+        # If a previous run already populated run_log_<date>/cutadapt_logs/, merge
+        if dest.exists():
+            for f in cutadapt_logs.iterdir():
+                shutil.move(str(f), str(dest / f.name))
+            cutadapt_logs.rmdir()
+        else:
+            shutil.move(str(cutadapt_logs), str(dest))
+        log(f"  Moved: cutadapt_logs/ -> {log_dir.name}/cutadapt_logs/")
+        moved += 1
+
+    log(f" Collected {moved} log items into {log_dir}")
+    log("========================================")
+    return log_dir
 
 
 def main() -> None:
@@ -457,6 +522,8 @@ def main() -> None:
         sys.exit(f"ERROR: chopper not found: {args.chopper}")
     if not args.minibar.is_file():
         sys.exit(f"ERROR: minibar.py not found: {args.minibar}")
+    if not args.cutadapt.is_file():
+        sys.exit(f"ERROR: cutadapt not found: {args.cutadapt}")
 
     output_dir = args.output_dir
     filtered_dir = output_dir / "chopper_filtered"
@@ -480,6 +547,16 @@ def main() -> None:
     merge_per_file_outputs(per_file_dirs, integrated_dir)
     cleanup(per_file_dirs, filtered_dir)
 
+    # ---- Step 2.5: two-pass cutadapt ----
+    run_cutadapt_step(
+        integrated_dir=integrated_dir,
+        primer_file=args.primer_file,
+        output_dir=output_dir,
+        cutadapt=args.cutadapt,
+        threads=args.cutadapt_threads,
+        error_rate=args.cutadapt_error_rate,
+    )
+
     # ---- Step 3 ----
     samples = load_client_map(args.samplesheet)
     organise_by_client(integrated_dir, samples)
@@ -488,6 +565,9 @@ def main() -> None:
         args.raw_input_dir, filtered_dir, output_dir,
         total_input,
     )
+
+    # ---- Final: gather logs into run_log_<date>/ ----
+    collect_logs(output_dir)
 
 
 if __name__ == "__main__":
