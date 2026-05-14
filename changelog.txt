@@ -1,3 +1,7 @@
+v5.02
+Date: 2026-05-14
+* Update: link iconPCR results to the sequencing results
+
 v5.01
 Date: 2026-05-13
 * Update: add cutadapt function to (1) normalize orientation of fastq files, and (2) trim adapter sequences from reads.

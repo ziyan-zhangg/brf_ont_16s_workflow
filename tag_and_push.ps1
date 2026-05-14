@@ -13,7 +13,7 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* Update: add cutadapt function to (1) normalize orientation of fastq files, and (2) trim adapter sequences from reads.
+* Update: link iconPCR results to the sequencing results
 "@
 
 Write-Host "Using version: $VER"

@@ -296,10 +296,20 @@ def cleanup(per_file_dirs: list[Path], filtered_dir: Path) -> None:
 class ClientSample:
     client: str
     sample_id: str
+    comment: str = ""  # optional, from samplesheet 'Comment' column
+
+
+# Threshold below which a low-read-count comment is shown in the per-client
+# summary. Set to None to disable, or change to suit future runs.
+LOW_READ_THRESHOLD = 15000
 
 
 def load_client_map(samplesheet: Path) -> list[ClientSample]:
-    """Read Client + Sample_ID columns; sanitise client names like the awk does."""
+    """Read Client + Sample_ID columns; sanitise client names like the awk does.
+
+    Also reads an optional 'Comment' column if present in the samplesheet.
+    Extra columns are silently ignored.
+    """
     if not samplesheet.exists():
         sys.exit(f"ERROR: sample sheet not found: {samplesheet}")
     out: list[ClientSample] = []
@@ -310,12 +320,18 @@ def load_client_map(samplesheet: Path) -> list[ClientSample]:
             sys.exit(
                 f"ERROR: {samplesheet} must have Client and Sample_ID columns"
             )
+        has_comment = "Comment" in reader.fieldnames
         for row in reader:
             client = (row.get("Client") or "").strip()
             sid = (row.get("Sample_ID") or "").strip()
             if not client or not sid:
                 continue
-            out.append(ClientSample(sanitise(client), sanitise_sample_id(sid)))
+            comment = (row.get("Comment") or "").strip() if has_comment else ""
+            out.append(ClientSample(
+                client=sanitise(client),
+                sample_id=sanitise_sample_id(sid),
+                comment=comment,
+            ))
     return out
 
 
@@ -345,25 +361,52 @@ def organise_by_client(
 
     log("")
     log(" Generating per-client summaries...")
+
+    # Build sample_id -> comment lookup once. Use the sanitised ID so it
+    # matches what's in the per-client filenames.
+    comment_by_sid: dict[str, str] = {cs.sample_id: cs.comment for cs in samples}
+
+    # Column widths
+    W_SAMPLE = 40
+    W_READS = 10
+    W_COMMENT = 50
+
     for client_subdir in sorted(p for p in integrated_dir.iterdir() if p.is_dir()):
         fastqs = sorted(client_subdir.glob("*.fastq.gz")) \
                  + sorted(client_subdir.glob("sample_*.fastq"))
         client_total = sum(count_fastq_reads(f) for f in fastqs)
 
+        sep_short = "-" * (W_SAMPLE + 1 + W_READS)
+        sep_long = "-" * (W_SAMPLE + 1 + W_READS + 1 + W_COMMENT)
+        edge_long = "=" * (W_SAMPLE + 1 + W_READS + 1 + W_COMMENT)
+
         lines = [
-            "========================================",
+            edge_long,
             f" Client: {client_subdir.name}",
             f" Date:   {datetime.now():%Y-%m-%d %H:%M:%S}",
-            "========================================",
-            f"{'Sample':<40} {'Reads':>10}",
-            "----------------------------------------",
+            f" Low-read comment threshold: < {LOW_READ_THRESHOLD:,} reads",
+            edge_long,
+            f"{'Sample':<{W_SAMPLE}} {'Reads':>{W_READS}} {'Comment':<{W_COMMENT}}",
+            sep_long,
         ]
         for f in fastqs:
-            lines.append(f"{f.stem:<40} {count_fastq_reads(f):>10d}")
+            reads = count_fastq_reads(f)
+            # Show the .fastq.gz extension explicitly (Path.stem strips only .gz).
+            display_name = f.name
+            # Look up the matching ClientSample via the file stem-without-extensions.
+            sid_key = f.name.removesuffix(".fastq.gz") if f.name.endswith(".fastq.gz") \
+                else f.stem.removeprefix("sample_")
+            # Only annotate when below threshold; otherwise leave blank.
+            comment = ""
+            if reads < LOW_READ_THRESHOLD:
+                comment = comment_by_sid.get(sid_key, "")
+            lines.append(
+                f"{display_name:<{W_SAMPLE}} {reads:>{W_READS}d} {comment:<{W_COMMENT}}"
+            )
         lines += [
-            "----------------------------------------",
-            f"{'CLIENT TOTAL':<40} {client_total:>10d}",
-            "========================================",
+            sep_long,
+            f"{'CLIENT TOTAL':<{W_SAMPLE}} {client_total:>{W_READS}d}",
+            edge_long,
         ]
         body = "\n".join(lines)
         log(body)

@@ -45,7 +45,7 @@ if [[ -z "$raw_input_dir" ]]; then
     exit 1
 fi
 
-tools_dir=/g/data/vz35/ONT_16s_workflow/tools
+tools_dir=/g/data/vz35/ONT_16s_workflow/tools/brf_ont_16s_workflow/
 generate_primer_script=${tools_dir}/generate_primer_setup.py # attention to location
 core_script=${tools_dir}/filter_chopper_demux_minibar.py # attention to location
 
