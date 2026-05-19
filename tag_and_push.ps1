@@ -13,7 +13,7 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* Update: link iconPCR results to the sequencing results
+* Update: Rewrite README.md and add Emu related functions.
 "@
 
 Write-Host "Using version: $VER"

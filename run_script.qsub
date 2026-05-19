@@ -39,11 +39,16 @@ output_dir=/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_${date_stamp
 
 #--------DONT-CHANGE----------------------------------------------------------
 _root=/g/data/vz35/PromethION_data/sequencer_uploads
-raw_input_dir=$(find "${_root}/${run_name}" -type d -name "fastq_pass" | head -1)
-if [[ -z "$raw_input_dir" ]]; then
+mapfile -t _fq_dirs < <(find "${_root}/${run_name}" -type d -name "fastq_pass")
+if [[ ${#_fq_dirs[@]} -eq 0 ]]; then
     echo "ERROR: fastq_pass not found under ${_root}/${run_name}" >&2
     exit 1
+elif [[ ${#_fq_dirs[@]} -gt 1 ]]; then
+    echo "ERROR: multiple fastq_pass directories found under ${_root}/${run_name}:" >&2
+    printf '  %s\n' "${_fq_dirs[@]}" >&2
+    exit 1
 fi
+raw_input_dir="${_fq_dirs[0]}"
 
 tools_dir=/g/data/vz35/ONT_16s_workflow/tools/brf_ont_16s_workflow/
 generate_primer_script=${tools_dir}/generate_primer_setup.py # attention to location

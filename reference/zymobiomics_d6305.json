@@ -1,0 +1,17 @@
+{
+    "name": "ZymoBIOMICS D6305",
+    "description": "Theoretical 16S rRNA abundances for the ZymoBIOMICS Microbial Community Standard (D6305). Eight bacterial species (yeasts excluded from 16S analysis).",
+    "species": {
+        "Bacillus subtilis":             17.4,
+        "Limosilactobacillus fermentum": 18.4,
+        "Staphylococcus aureus":         15.5,
+        "Listeria monocytogenes":        14.1,
+        "Salmonella enterica":           10.4,
+        "Escherichia coli":              10.1,
+        "Enterococcus faecalis":          9.9,
+        "Pseudomonas aeruginosa":         4.2
+    },
+    "aliases": {
+        "Lactobacillus fermentum": "Limosilactobacillus fermentum"
+    }
+}

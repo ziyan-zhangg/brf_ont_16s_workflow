@@ -52,7 +52,7 @@ from cutadapt_2pass import run_cutadapt_step, DEFAULT_CUTADAPT  # noqa: E402
 
 
 # --- Defaults (Gadi) ---------------------------------------------------------
-DEFAULT_CHOPPER = Path("/g/data/vz35/zpfeng/tools/chopper/chopper-linux-musl")
+DEFAULT_CHOPPER = Path("/g/data/vz35/ONT_16s_workflow/tools/chopper/chopper-linux-musl")
 DEFAULT_MINIBAR = Path("/g/data/vz35/ONT_16s_workflow/tools/minibar/minibar.py")
 
 

@@ -1,0 +1,131 @@
+#!/bin/bash
+#PBS -N emu_control
+#PBS -P vz35
+#PBS -q biodev
+#PBS -l ncpus=8
+#PBS -l mem=32GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/vz35
+#PBS -l wd
+#PBS -M ziyan.zhang@anu.edu.au
+
+#============================================================
+# Emu species profiling
+#
+# Outputs (emu_output/, logs/) are created next to the INPUT file.
+#============================================================
+
+set -euo pipefail
+
+#============================================================
+# >>> USER CONFIG — edit these for each run <<<
+#============================================================
+
+# Full path to the input FASTQ (.fastq or .fastq.gz)
+INPUT="/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_20260519/integrated_demultiplexing/BRF/Positive.fastq.gz"
+
+# Basename for Emu output files (e.g. Positive_control_rel-abundance.tsv)
+SAMPLE_NAME="Positive_control"
+
+# Reference mock community for the post-run comparison.
+# Set to "" (empty) to skip the comparison (e.g. for non-control samples).
+# Options: "zymobiomics_d6305"  |  ""  (or add your own to references/)
+REFERENCE="zymobiomics_d6305"
+
+# Minimum abundance threshold passed to Emu
+MIN_ABUNDANCE=0.005
+
+#============================================================
+# >>> Tooling paths (rarely changed) <<<
+#============================================================
+
+TOOLS="/g/data/vz35/ONT_16s_workflow/tools"
+MINIFORGE="${TOOLS}/miniforge3"
+EMU_ENV="${TOOLS}/emu_env"
+EMU_DB="${TOOLS}/emu_db"
+
+# Directory holding emu_summary.py + references/
+SCRIPT_DIR="/g/data/vz35/ONT_16s_workflow/tools/brf_ont_16s_workflow"
+
+#============================================================
+# Derived paths — output and logs live next to the input
+#============================================================
+
+INPUT_DIR="$(dirname "${INPUT}")"
+OUTDIR="${INPUT_DIR}/emu_output"
+LOGDIR="${INPUT_DIR}/logs"
+
+mkdir -p "${OUTDIR}" "${LOGDIR}"
+
+#============================================================
+# Activate environment
+#============================================================
+
+source "${MINIFORGE}/etc/profile.d/conda.sh"
+conda activate "${EMU_ENV}"
+export EMU_DATABASE_DIR="${EMU_DB}"
+
+echo "============================================================"
+echo " Emu species profiling"
+echo "============================================================"
+echo " Job:        ${PBS_JOBID:-interactive}"
+echo " Sample:     ${SAMPLE_NAME}"
+echo " Reference:  ${REFERENCE:-<none>}"
+echo " Input:      ${INPUT}"
+echo " Output:     ${OUTDIR}"
+echo " Logs:       ${LOGDIR}"
+echo " Threads:    ${PBS_NCPUS:-$(nproc)}"
+echo " Date:       $(date)"
+echo "============================================================"
+echo ""
+
+#============================================================
+# Run Emu
+#============================================================
+
+emu abundance \
+    --type map-ont \
+    --db "${EMU_DB}" \
+    --output-dir "${OUTDIR}" \
+    --output-basename "${SAMPLE_NAME}" \
+    --keep-counts \
+    --keep-read-assignments \
+    --threads "${PBS_NCPUS:-8}" \
+    --min-abundance "${MIN_ABUNDANCE}" \
+    "${INPUT}"
+
+echo ""
+echo "Emu finished: $(date)"
+echo ""
+
+#============================================================
+# Post-run summary (Python)
+#============================================================
+
+RESULT="${OUTDIR}/${SAMPLE_NAME}_rel-abundance.tsv"
+
+if [[ ! -f "${RESULT}" ]]; then
+    echo "ERROR: expected output not found: ${RESULT}" >&2
+    exit 1
+fi
+
+if [[ -n "${REFERENCE}" ]]; then
+    REF_JSON="${SCRIPT_DIR}/references/${REFERENCE}.json"
+    if [[ ! -f "${REF_JSON}" ]]; then
+        echo "WARNING: reference file not found: ${REF_JSON}" >&2
+        echo "         Skipping comparison." >&2
+        python3 "${SCRIPT_DIR}/emu_summary.py" --result "${RESULT}"
+    else
+        python3 "${SCRIPT_DIR}/emu_summary.py" \
+            --result "${RESULT}" \
+            --reference "${REF_JSON}"
+    fi
+else
+    python3 "${SCRIPT_DIR}/emu_summary.py" --result "${RESULT}"
+fi
+
+echo ""
+echo "============================================================"
+echo " Full results: ${RESULT}"
+echo " Log dir:      ${LOGDIR}"
+echo "============================================================"

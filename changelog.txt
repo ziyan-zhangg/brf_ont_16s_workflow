@@ -1,3 +1,7 @@
+v5.03
+Date: 2026-05-19
+* Update: Rewrite README.md and add Emu related functions.
+
 v5.02
 Date: 2026-05-14
 * Update: link iconPCR results to the sequencing results
