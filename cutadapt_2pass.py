@@ -313,7 +313,7 @@ def run_cutadapt_step(
     cutadapt: Path = DEFAULT_CUTADAPT,
     threads: int = 4,
     error_rate: float = 0.2,
-) -> Path:
+) -> tuple[Path, list[CutadaptStats]]:
     """
     For every sample_<SampleID>.fastq in integrated_dir whose SampleID is in
     the primer setup file:
@@ -322,10 +322,12 @@ def run_cutadapt_step(
         - remove the source sample_*.fastq on success
     sample_unk.fastq and sample_Multiple_Matches.fastq are left untouched.
 
-    Returns the path to the cutadapt summary file written to output_dir.
+    Returns (path to the cutadapt summary written to output_dir, per-sample
+    stats). The caller needs the stats to report pass-1 retention alongside
+    the demux and Chopper counts in read_counts_summary.txt.
     """
     _log("")
-    _banner("STEP 2.5: Cutadapt two-pass (orient + trim)")
+    _banner("STEP 5: Cutadapt two-pass (orient + trim)")
 
     if not cutadapt.is_file():
         sys.exit(f"ERROR: cutadapt not found at {cutadapt}")
@@ -350,7 +352,10 @@ def run_cutadapt_step(
     sample_fastqs = sorted(integrated_dir.glob("sample_*.fastq"))
     if not sample_fastqs:
         _log("  WARNING: no sample_*.fastq files found; nothing to do.")
-        return _write_summary(output_dir, all_stats, missing_primers, skipped_files)
+        return (
+            _write_summary(output_dir, all_stats, missing_primers, skipped_files),
+            all_stats,
+        )
 
     for fq in sample_fastqs:
         stem = fq.stem  # e.g. "sample_PPCS-4"
@@ -415,7 +420,7 @@ def run_cutadapt_step(
     summary_path = _write_summary(output_dir, all_stats, missing_primers, skipped_files)
     _log(f" Cutadapt step complete: {datetime.now():%Y-%m-%d %H:%M:%S}")
     _log("========================================")
-    return summary_path
+    return summary_path, all_stats
 
 
 def _write_summary(

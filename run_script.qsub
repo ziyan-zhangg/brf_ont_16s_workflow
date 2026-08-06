@@ -6,7 +6,7 @@
 #PBS -M ziyan.zhang@anu.edu.au
 #PBS -l ncpus=2
 #PBS -l mem=10GB
-#PBS -l jobfs=10GB
+#PBS -l jobfs=200GB
 #PBS -l walltime=20:00:00
 #PBS -l storage=gdata/vz35
 #PBS -q biodev
@@ -15,9 +15,55 @@
 # Slim wrapper around the Python core pipeline.
 #   Pre-step: generate_primer_setup.py  -> 16S_primer_setup_<date>.txt
 #   Core:     filter_chopper_demux_minibar.py
-#               Step 1 - Chopper filter (Q>=15, 1-2kb)
-#               Step 2 - Minibar demultiplex
-#               Step 3 - Organise reads by client + write summaries
+#               Step 1 - Chopper filter, whole files  (pre mode only)
+#               Step 2 - Minibar demultiplex + merge
+#               Step 3 - Per-sample demux QC -> demux_qc/
+#               Step 4 - Chopper filter, per sample   (post mode only)
+#               Step 5 - Cutadapt two-pass orient + trim
+#               Step 6 - Organise reads by client + write summaries
+#               Step 7 - Collect logs into run_log_<date>/
+#
+# Both modes share this numbering, so step N means the same thing in either
+# job log. pre skips step 4; post skips step 1.
+#
+# Set filter_stage below to choose when Chopper runs. Both orderings are
+# runnable on the same input; pre is the unchanged legacy behaviour.
+#
+# For a first look at an unfamiliar run, add --diagnostic to the core call:
+# it forces post mode with a 100-5000 bp window so the demux QC observes the
+# real length distribution instead of assuming 1-2 kb.
+#
+#--------Resource notes-------------------------------------------------------
+# jobfs=200GB  In post mode Minibar's per-file working directories hold
+#              unfiltered reads and are several times larger than in pre
+#              mode, so they go to $PBS_JOBFS (node-local) and only the
+#              merged result is written to $output_dir. 10GB was sized for
+#              the pre-mode, already-filtered case and is not enough.
+#              NOTE: on queues that ration jobfs per core, 200GB may need
+#              more than ncpus=2 to be schedulable. If the job will not
+#              start, raise ncpus before lowering jobfs.
+#
+# storage      gdata/vz35 covers every path this job touches, and nothing
+#              here touches /scratch: the PromethION uploads (input),
+#              sample_sheet/, tools/ and minibar_output/ (output) all live
+#              under /g/data/vz35. $PBS_JOBFS is node-local and needs no
+#              storage flag, so post mode adds no new mount either.
+#              Only add scratch/vz35 here if a path above actually moves
+#              to scratch.
+#
+# walltime     Left at 20h. Post mode feeds Minibar 2-4x more reads than
+#              pre mode (nothing is filtered out first), and Minibar is the
+#              dominant cost, so the post-mode margin is much thinner than
+#              the pre-mode margin. Check the Step 2 timestamps in the job
+#              log on the first post-mode run before assuming 20h holds.
+#
+# parallelism  This is deliberately still one wide job rather than a job
+#              array: the merge, QC and summary steps all need every
+#              per-file Minibar output present at once. The per-file
+#              Minibar loop in Step 2 is the parallelisable unit (it is
+#              currently serial inside the Python core) and is where a
+#              GNU-parallel fan-out would go if post-mode walltime becomes
+#              a problem. Keep any such change inside this single job.
 #-----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -34,8 +80,13 @@ run_name=ONT_16S_20260422
 # sample sheet CSV (columns: Client, Sample_ID, Barcode)
 samplesheet=/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv
 
-# run output (will hold integrated_demultiplexing/ + read_counts_summary.txt)
+# run output (will hold integrated_demultiplexing/ + demux_qc/ + read_counts_summary.txt)
 output_dir=/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_${date_stamp}
+
+# when Chopper runs relative to demultiplexing:
+#   pre  - filter raw fastq.gz first, then demultiplex   (legacy, default)
+#   post - demultiplex raw fastq_pass, then filter per sample
+filter_stage=pre
 
 #--------DONT-CHANGE----------------------------------------------------------
 _root=/g/data/vz35/PromethION_data/sequencer_uploads
@@ -57,7 +108,29 @@ core_script=${tools_dir}/filter_chopper_demux_minibar.py # attention to location
 primer_output_dir=/g/data/vz35/ONT_16s_workflow/sample_sheet
 primer_file="${primer_output_dir}/16S_primer_setup_${date_stamp}.txt"
 
+case "$filter_stage" in
+    pre|post) ;;
+    *) echo "ERROR: filter_stage must be 'pre' or 'post', got '${filter_stage}'" >&2
+       exit 1 ;;
+esac
+
 mkdir -p "$output_dir"
+
+# Post mode only: keep Minibar's bulky per-file working directories on
+# node-local jobfs. The merged per-sample fastqs still land in $output_dir.
+# Pre mode is left alone so its on-disk layout stays exactly as before.
+core_extra_args=()
+if [[ "$filter_stage" == "post" ]]; then
+    if [[ -n "${PBS_JOBFS:-}" ]]; then
+        minibar_work_dir="${PBS_JOBFS}/minibar_work"
+    else
+        # interactive / non-PBS fallback
+        minibar_work_dir="${output_dir}/minibar_work"
+        echo "WARNING: PBS_JOBFS unset; Minibar working dirs go to ${minibar_work_dir}" >&2
+    fi
+    mkdir -p "$minibar_work_dir"
+    core_extra_args+=(--minibar-work-dir "$minibar_work_dir")
+fi
 
 #=============================================================================
 # PRE-STEP: Generate primer setup file
@@ -76,10 +149,21 @@ echo " Primer file: $primer_file"
 echo "========================================"
 
 #=============================================================================
-# CORE: Chopper filter -> Minibar demux -> organise by client
+# CORE: Chopper filter -> Minibar demux -> demux QC -> cutadapt -> by client
+#       (Chopper runs before or after demux depending on $filter_stage)
 #=============================================================================
+echo " Filter stage: ${filter_stage}"
+if [[ "$filter_stage" == "post" ]]; then
+    echo " Minibar work dir: ${minibar_work_dir}"
+fi
+echo "========================================"
+
 python3 "$core_script" \
     --raw-input-dir "$raw_input_dir" \
     --output-dir    "$output_dir" \
     --primer-file   "$primer_file" \
-    --samplesheet   "$samplesheet"
+    --samplesheet   "$samplesheet" \
+    --filter-stage  "$filter_stage" \
+    ${core_extra_args[@]+"${core_extra_args[@]}"}
+    # ^ expands to nothing when the array is empty, without tripping `set -u`
+    #   on older bash where "${arr[@]}" counts as an unbound reference.
