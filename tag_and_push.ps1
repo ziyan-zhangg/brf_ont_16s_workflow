@@ -13,7 +13,7 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* Update: Rewrite README.md and add Emu related functions.
+* Change the logics: demultiplex first and then filter to catch traces of unspecific amplification.
 "@
 
 Write-Host "Using version: $VER"
