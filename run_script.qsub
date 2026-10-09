@@ -4,10 +4,10 @@
 #PBS -l wd
 #PBS -m e
 #PBS -M ziyan.zhang@anu.edu.au
-#PBS -l ncpus=2
-#PBS -l mem=10GB
+#PBS -l ncpus=16
+#PBS -l mem=64GB
 #PBS -l jobfs=200GB
-#PBS -l walltime=20:00:00
+#PBS -l walltime=08:00:00
 #PBS -l storage=gdata/vz35
 #PBS -q biodev
 
@@ -34,13 +34,36 @@
 # real length distribution instead of assuming 1-2 kb.
 #
 #--------Resource notes-------------------------------------------------------
-# jobfs=200GB  In post mode Minibar's per-file working directories hold
+# ncpus=16     Step 2 now runs Minibar on several chunks at once, one
+#              subprocess per worker, with max_workers taken from
+#              $PBS_NCPUS. Minibar itself is still single-threaded pure
+#              Python, so the chunk count is the unit of parallelism.
+#              The speed-up is bounded by the number of large chunks and
+#              then by the single largest chunk -- 16 workers do nothing
+#              for a run that arrives as 4 chunks, and the job cannot
+#              finish faster than its slowest chunk.
+#              Stay within one node (48 cores or fewer on Gadi); this is a
+#              shared-memory thread pool, not an MPI job. Check biodev's
+#              own per-job ncpus/mem ceiling before raising this further.
+#
+# mem=64GB     About 4GB per core, which is the usual Gadi ratio. Each
+#              worker holds one Minibar process, so peak memory now scales
+#              with ncpus rather than being a single process's footprint.
+#              Check the PBS resource footer for actual peak memory on the
+#              first parallel run and trim this if it is nowhere near 64GB.
+#
+# walltime=8h  Was 20h for the serial loop. Step 2 is the dominant cost and
+#              is now parallel, so the margin should be ample -- but
+#              confirm against the Step 2 timestamps on the first parallel
+#              run before trusting 8h for a large post-mode run.
+#
+# jobfs=200GB  Minibar's per-chunk working directories go to $PBS_JOBFS
+#              (node-local) in both modes, and in post mode they hold
 #              unfiltered reads and are several times larger than in pre
-#              mode, so they go to $PBS_JOBFS (node-local) and only the
-#              merged result is written to $output_dir. 10GB was sized for
-#              the pre-mode, already-filtered case and is not enough.
+#              mode. Pre mode also writes its Chopper output there now.
+#              10GB was sized for the old pre-mode layout and is not enough.
 #              NOTE: on queues that ration jobfs per core, 200GB may need
-#              more than ncpus=2 to be schedulable. If the job will not
+#              a certain ncpus to be schedulable. If the job will not
 #              start, raise ncpus before lowering jobfs.
 #
 # storage      gdata/vz35 covers every path this job touches, and nothing
@@ -51,19 +74,13 @@
 #              Only add scratch/vz35 here if a path above actually moves
 #              to scratch.
 #
-# walltime     Left at 20h. Post mode feeds Minibar 2-4x more reads than
-#              pre mode (nothing is filtered out first), and Minibar is the
-#              dominant cost, so the post-mode margin is much thinner than
-#              the pre-mode margin. Check the Step 2 timestamps in the job
-#              log on the first post-mode run before assuming 20h holds.
-#
-# parallelism  This is deliberately still one wide job rather than a job
-#              array: the merge, QC and summary steps all need every
-#              per-file Minibar output present at once. The per-file
-#              Minibar loop in Step 2 is the parallelisable unit (it is
-#              currently serial inside the Python core) and is where a
-#              GNU-parallel fan-out would go if post-mode walltime becomes
-#              a problem. Keep any such change inside this single job.
+# parallelism  Deliberately one wide job rather than a job array: the
+#              merge, QC and summary steps all need every per-chunk Minibar
+#              output present at once. The fan-out lives inside the Python
+#              core (a thread pool over subprocesses in run_minibar), so it
+#              stays within this single job and needs no GNU parallel.
+#              Post mode still feeds Minibar 2-4x more reads than pre mode,
+#              since nothing is filtered out first.
 #-----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -116,21 +133,20 @@ esac
 
 mkdir -p "$output_dir"
 
-# Post mode only: keep Minibar's bulky per-file working directories on
-# node-local jobfs. The merged per-sample fastqs still land in $output_dir.
-# Pre mode is left alone so its on-disk layout stays exactly as before.
+# Both modes: keep Minibar's bulky per-chunk working directories on
+# node-local jobfs. They are purely intermediate -- only the merged
+# per-sample fastqs land in $output_dir -- and the per-chunk minibar.log
+# files are copied back there by the core script before cleanup.
 core_extra_args=()
-if [[ "$filter_stage" == "post" ]]; then
-    if [[ -n "${PBS_JOBFS:-}" ]]; then
-        minibar_work_dir="${PBS_JOBFS}/minibar_work"
-    else
-        # interactive / non-PBS fallback
-        minibar_work_dir="${output_dir}/minibar_work"
-        echo "WARNING: PBS_JOBFS unset; Minibar working dirs go to ${minibar_work_dir}" >&2
-    fi
-    mkdir -p "$minibar_work_dir"
-    core_extra_args+=(--minibar-work-dir "$minibar_work_dir")
+if [[ -n "${PBS_JOBFS:-}" ]]; then
+    minibar_work_dir="${PBS_JOBFS}/minibar_work"
+else
+    # interactive / non-PBS fallback
+    minibar_work_dir="${output_dir}/minibar_work"
+    echo "WARNING: PBS_JOBFS unset; Minibar working dirs go to ${minibar_work_dir}" >&2
 fi
+mkdir -p "$minibar_work_dir"
+core_extra_args+=(--minibar-work-dir "$minibar_work_dir")
 
 #=============================================================================
 # PRE-STEP: Generate primer setup file

@@ -68,6 +68,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import gzip
 import os
@@ -99,9 +100,15 @@ DEFAULT_MINIBAR = Path("/g/data/vz35/ONT_16s_workflow/tools/minibar/minibar.py")
 # =============================================================================
 # Helpers
 # =============================================================================
+# Step 2 logs from worker threads, and print() emits the message and the
+# newline as two separate writes, so without this the job log interleaves.
+_LOG_LOCK = threading.Lock()
+
+
 def log(msg: str = "") -> None:
     """Flushed print so the PBS job log stays in order."""
-    print(msg, flush=True)
+    with _LOG_LOCK:
+        print(msg, flush=True)
 
 
 def banner(title: str) -> None:
@@ -118,6 +125,21 @@ def count_fastq_reads(path: Path) -> int:
         for _ in fh:
             lines += 1
     return lines // 4
+
+
+def fastq_has_reads(path: Path) -> bool:
+    """True if a fastq holds at least one byte of payload, gzipped or plain.
+
+    Chopper writes an output file for every input chunk, including ones where
+    it kept 0 reads. Gzipped, those are valid ~70-byte members with no
+    records, so a size check cannot spot them -- the first decompressed byte
+    has to be read. Minibar indexes the first line of whatever it opens and
+    dies with IndexError on an empty one.
+    """
+    if path.suffix == ".gz":
+        with gzip.open(path, "rb") as fh:
+            return bool(fh.read(1))
+    return path.stat().st_size > 0
 
 
 def sanitise(name: str) -> str:
@@ -340,65 +362,130 @@ def run_chopper_per_sample(
 # =============================================================================
 # Step 2 - Minibar demultiplexing + merge
 # =============================================================================
+def minibar_chunk_name(input_file: Path) -> str:
+    """Working-directory name for one chunk.
+
+    Strips both suffixes so X.fastq.gz, X_filtered.fastq.gz and the plain
+    X_filtered.fastq that pre mode now writes all give the same stem.
+    """
+    return input_file.name.removesuffix(".gz").removesuffix(".fastq")
+
+
+def _minibar_one(
+    input_file: Path,
+    work_dir: Path,
+    primer_file: Path,
+    minibar_prog: Path,
+    minibar_log_dir: Path,
+) -> tuple[Path, Path, int]:
+    """
+    Demultiplex one chunk in its own subdirectory of work_dir.
+
+    Equivalent to:
+        cd WORKDIR/<base> && python3 minibar.py -e 1 -E 5 -l 200 -M 2 -F PRIMER IN
+
+    Returns (input_file, outd, returncode). Minibar's own progress output
+    goes to <outd>/minibar.log instead of the job log: several chunks run at
+    once now, and their interleaved stdout was unreadable. A copy is kept in
+    minibar_log_dir, which lives in the output dir, because work_dir is on
+    node-local $PBS_JOBFS and does not outlive the job.
+    """
+    base = minibar_chunk_name(input_file)
+    outd = work_dir / base
+    outd.mkdir(parents=True, exist_ok=True)
+    chunk_log = outd / "minibar.log"
+
+    cmd = [
+        sys.executable, str(minibar_prog),
+        "-e", "1",
+        "-E", "5",
+        "-l", "200",
+        "-M", "2",
+        "-F",
+        str(primer_file),
+        str(input_file),
+    ]
+
+    log(f"  START  {base}  ({datetime.now():%H:%M:%S})  input: {input_file}")
+    # minibar writes per-sample fastqs into its current working directory
+    with chunk_log.open("wb") as logfh:
+        rc = subprocess.call(cmd, cwd=outd,
+                             stdout=logfh, stderr=subprocess.STDOUT)
+    log(f"  DONE   {base}  ({datetime.now():%H:%M:%S})  exit {rc}")
+
+    # Copied now, not at step 7: a non-zero rc aborts the run before
+    # collect_logs() gets a chance, and the jobfs copy would be lost.
+    try:
+        shutil.copyfile(chunk_log, minibar_log_dir / f"{base}.log")
+    except OSError as exc:
+        log(f"  WARNING: could not save {chunk_log}: {exc}")
+
+    return input_file, outd, rc
+
+
 def run_minibar(
     filtered_files: list[Path],
     work_dir: Path,
     primer_file: Path,
     minibar_prog: Path,
+    minibar_log_dir: Path,
+    max_workers: int | None = None,
 ) -> list[Path]:
     """
-    Run minibar on each input file in its own subdirectory of work_dir.
+    Run minibar on every input file, several chunks at a time.
 
-    Equivalent to:
-        cd WORKDIR/<base> && python3 minibar.py -e 1 -E 5 -l 200 -M 2 -T -F PRIMER IN
+    Minibar is single-threaded pure Python and the dominant cost of the run,
+    so the chunks are spread across PBS_NCPUS workers. A thread pool is
+    enough because each chunk is a subprocess; the threads only wait on it.
 
-    work_dir defaults to the run output dir (pre mode, matching the legacy
-    layout). In post mode Minibar sees unfiltered reads, so these per-file
-    trees are several times larger and the caller points work_dir at
-    $PBS_JOBFS instead; only the merged result lands in the output dir.
+    The returned directories are in input order, so merge_per_file_outputs()
+    concatenates chunks in the same order a serial run did and the merged
+    per-sample fastqs stay byte-identical.
     """
     log("")
     banner("STEP 2: Minibar demultiplexing")
+
+    if max_workers is None:
+        max_workers = int(os.environ.get("PBS_NCPUS", "1") or "1")
+    # More workers than chunks would just sit idle, and the pool needs >= 1.
+    workers = max(1, min(max_workers, len(filtered_files)))
+
     log(f" Work dir: {work_dir}")
+    log(f" Log dir:  {minibar_log_dir}")
+    log(f" Workers:  {workers} (PBS_NCPUS={os.environ.get('PBS_NCPUS', 'unset')}, "
+        f"{len(filtered_files)} chunk(s))")
     log(f" Files found:")
     for f in filtered_files:
         log(f"   {f}")
     log("")
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    per_file_dirs: list[Path] = []
-    for input_file in filtered_files:
-        base = input_file.name.removesuffix(".fastq.gz")
-        outd = work_dir / base
-        outd.mkdir(parents=True, exist_ok=True)
+    minibar_log_dir.mkdir(parents=True, exist_ok=True)
 
-        log(f"--- Processing: {base} ---")
-        log(f"  Input:  {input_file}")
-        log(f"  Outdir: {outd}")
-        log(f"  Start:  {datetime.now():%Y-%m-%d %H:%M:%S}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        # ex.map yields in input order regardless of completion order.
+        results = list(ex.map(
+            lambda f: _minibar_one(f, work_dir, primer_file, minibar_prog,
+                                   minibar_log_dir),
+            filtered_files,
+        ))
 
-        cmd = [
-            sys.executable, str(minibar_prog),
-            "-e", "1",
-            "-E", "5",
-            "-l", "200",
-            "-M", "2",
-            "-F",
-            str(primer_file),
-            str(input_file),
-        ]
-        # minibar writes per-sample fastqs into its current working directory
-        rc = subprocess.call(cmd, cwd=outd)
-        if rc != 0:
-            sys.exit(f"ERROR: minibar failed on {input_file} (exit {rc})")
-
-        log(f"  Done:   {datetime.now():%Y-%m-%d %H:%M:%S}")
+    # Every chunk is allowed to finish before the run aborts, so one failure
+    # does not hide the others. A non-zero rc is still fatal.
+    failed = [(f, outd, rc) for f, outd, rc in results if rc != 0]
+    if failed:
         log("")
-        per_file_dirs.append(outd)
+        for f, outd, rc in failed:
+            saved = minibar_log_dir / f"{minibar_chunk_name(f)}.log"
+            log(f" ERROR: minibar failed on {f} (exit {rc})")
+            log(f"        log: {saved}")
+        sys.exit(f"ERROR: minibar failed on {len(failed)} of "
+                 f"{len(results)} chunk(s); see the logs above")
 
+    log("")
     log(f" All files demultiplexed: {datetime.now():%Y-%m-%d %H:%M:%S}")
     log("========================================")
-    return per_file_dirs
+    return [outd for _, outd, _ in results]
 
 
 def merge_per_file_outputs(
@@ -904,18 +991,22 @@ def collect_logs(output_dir: Path) -> Path:
                 moved += 1
                 log(f"  Moved: {src.name}")
 
-    # Cutadapt per-sample logs live in output_dir/cutadapt_logs/
-    cutadapt_logs = output_dir / "cutadapt_logs"
-    if cutadapt_logs.is_dir():
-        dest = log_dir / cutadapt_logs.name
-        # If a previous run already populated run_log_<date>/cutadapt_logs/, merge
+    # Per-sample cutadapt logs and per-chunk minibar logs live in their own
+    # subdirectories of output_dir. The minibar ones were copied off jobfs by
+    # run_minibar(), which is why they survive cleanup() having run.
+    for name in ("cutadapt_logs", "minibar_logs"):
+        src_dir = output_dir / name
+        if not src_dir.is_dir():
+            continue
+        dest = log_dir / name
+        # If a previous run already populated run_log_<date>/<name>/, merge
         if dest.exists():
-            for f in cutadapt_logs.iterdir():
+            for f in src_dir.iterdir():
                 shutil.move(str(f), str(dest / f.name))
-            cutadapt_logs.rmdir()
+            src_dir.rmdir()
         else:
-            shutil.move(str(cutadapt_logs), str(dest))
-        log(f"  Moved: cutadapt_logs/ -> {log_dir.name}/cutadapt_logs/")
+            shutil.move(str(src_dir), str(dest))
+        log(f"  Moved: {name}/ -> {log_dir.name}/{name}/")
         moved += 1
 
     log(f" Collected {moved} log items into {log_dir}")
@@ -941,13 +1032,25 @@ def main() -> None:
     integrated_dir = output_dir / "integrated_demultiplexing"
     qc_dir = output_dir / "demux_qc"
     summary_file = output_dir / "read_counts_summary.txt"
-    minibar_work_dir = args.minibar_work_dir or output_dir
+    # Minibar's per-chunk trees are bulky and purely intermediate, so they go
+    # to node-local jobfs in both modes; only the merged result reaches
+    # output_dir. An explicit --minibar-work-dir still wins.
+    if args.minibar_work_dir is not None:
+        minibar_work_dir = args.minibar_work_dir
+    elif os.environ.get("PBS_JOBFS"):
+        minibar_work_dir = Path(os.environ["PBS_JOBFS"]) / "minibar_work"
+    else:
+        minibar_work_dir = output_dir
+    minibar_log_dir = output_dir / "minibar_logs"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     integrated_dir.mkdir(parents=True, exist_ok=True)
 
     log(f" Primer file:  {args.primer_file}")
     log(f" Filter stage: {args.filter_stage}")
+    if args.minibar_work_dir is None and not os.environ.get("PBS_JOBFS"):
+        log(f" WARNING: PBS_JOBFS unset; Minibar working dirs go to "
+            f"{minibar_work_dir}")
     log(f" Chopper:      -q {args.min_quality} --minlength {args.minlength} "
         f"--maxlength {args.maxlength}"
         + ("   [--diagnostic]" if args.diagnostic else ""))
@@ -973,9 +1076,23 @@ def main() -> None:
         log("========================================")
         total_input = count_raw_total(minibar_inputs)
 
+    # Drop record-less inputs before minibar sees them. total_input is already
+    # counted above and these contribute 0 reads, so the totals do not move.
+    non_empty = []
+    for f in minibar_inputs:
+        if fastq_has_reads(f):
+            non_empty.append(f)
+        else:
+            log(f" SKIP (0 reads): {f.name}")
+    if not non_empty:
+        sys.exit("ERROR: every input fastq is empty -- nothing to "
+                 f"demultiplex (checked {len(minibar_inputs)} file(s))")
+    minibar_inputs = non_empty
+
     # ---- Step 2: Minibar ----
     per_file_dirs = run_minibar(
         minibar_inputs, minibar_work_dir, args.primer_file, args.minibar,
+        minibar_log_dir,
     )
     merge_per_file_outputs(per_file_dirs, integrated_dir)
     cleanup(per_file_dirs, filtered_dir)
