@@ -33,6 +33,12 @@
 # it forces post mode with a 100-5000 bp window so the demux QC observes the
 # real length distribution instead of assuming 1-2 kb.
 #
+# NOTE: pre mode no longer leaves chopper_filtered/ under $output_dir on
+# /g/data -- step 1 writes plain fastq to $PBS_JOBFS and step 2 deletes it.
+# Anything that expected to resume from that folder (the one-off
+# resume_20261009.qsub) will not work on future runs, and is not needed now
+# that zero-read chunks are skipped instead of killing the job.
+#
 #--------Resource notes-------------------------------------------------------
 # ncpus=16     Step 2 now runs Minibar on several chunks at once, one
 #              subprocess per worker, with max_workers taken from

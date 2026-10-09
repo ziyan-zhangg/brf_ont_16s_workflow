@@ -198,10 +198,12 @@ Each `*.fastq.gz` file in `fastq_pass/` is piped through Chopper, and reads that
 All three are now command-line options on the core script rather than hardcoded (`--min-length` / `--max-length` are accepted as aliases). The equivalent command run per file:
 
 ```
-zcat <file>.fastq.gz | chopper -q 15 --minlength 1000 --maxlength 2000 | gzip > <file>_filtered.fastq.gz
+zcat <file>.fastq.gz | chopper -q 15 --minlength 1000 --maxlength 2000 > <file>_filtered.fastq
 ```
 
-Filtered files are written to `chopper_filtered/` and deleted automatically after demultiplexing.
+Filtered files are written to `$PBS_JOBFS/chopper_filtered/` (falling back to `output_dir/chopper_filtered/` when `PBS_JOBFS` is unset) and deleted automatically after demultiplexing.
+
+They are written **uncompressed**. They are intermediate — Minibar reads them once and `cleanup()` deletes them — and gzipping them cost more than the rest of step 1 combined, because Python's gzip writer defaults to `compresslevel=9` (~8 MB/s, which also throttled Chopper itself). Keeping them on node-local jobfs means the larger uncompressed intermediate never touches `/g/data`.
 
 ---
 

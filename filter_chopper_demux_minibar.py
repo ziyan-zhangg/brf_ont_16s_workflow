@@ -12,7 +12,8 @@ same thing -- so the job logs of a pre run and a post run line up. Each mode
 skips exactly one step: pre skips step 4, post skips step 1.
 
 --filter-stage pre (default, unchanged legacy behaviour):
-    Step 1 - Chopper:  filter each raw fastq.gz for Q/length before demux
+    Step 1 - Chopper:  filter each raw fastq.gz for Q/length before demux,
+             writing plain fastq to jobfs (intermediate, deleted at step 2)
     Step 2 - Minibar:  demultiplex each filtered file, merge, keep primers
     Step 3 - Demux QC: per-sample stats (see note below)
     Step 4 - skipped.  Chopper already ran at step 1.
@@ -216,11 +217,19 @@ def run_chopper(
     max_length: int,
 ) -> list[Path]:
     """
-    Pipe each fastq.gz through chopper and gzip the result back.
+    Pipe each fastq.gz through chopper, writing plain fastq.
     Only used by --filter-stage pre.
 
     Equivalent to:
-        zcat IN | chopper -q Q --minlength MIN --maxlength MAX | gzip > OUT
+        zcat IN | chopper -q Q --minlength MIN --maxlength MAX > OUT
+
+    The output is deliberately not gzipped. These files are intermediate --
+    Minibar decompresses them immediately and cleanup() deletes them -- and
+    recompressing cost more than everything else in this step put together:
+    Python's gzip writer defaults to compresslevel=9, which measured ~8 MB/s
+    and throttled chopper itself, for no benefit on a file that is about to
+    be read once and thrown away. The caller puts filtered_dir on jobfs so
+    the larger intermediate never touches /g/data.
     """
     banner("STEP 1: Chopper filtering")
     log(f" Input dir:    {raw_input_dir}")
@@ -235,17 +244,17 @@ def run_chopper(
     outputs: list[Path] = []
     for f in inputs:
         sample = f.name.removesuffix(".fastq.gz")
-        out_file = filtered_dir / f"{sample}_filtered.fastq.gz"
+        out_file = filtered_dir / f"{sample}_filtered.fastq"
 
         log(f"  Filtering: {sample}")
         log(f"    Input:  {f}")
         log(f"    Output: {out_file}")
         log(f"    Start:  {datetime.now():%Y-%m-%d %H:%M:%S}")
 
-        # zcat | chopper | gzip   -- assemble as a process pipeline
-        with gzip.open(f, "rb") as zin, gzip.open(out_file, "wb") as zout:
+        # zcat | chopper > OUT   -- assemble as a process pipeline
+        with gzip.open(f, "rb") as zin, out_file.open("wb") as fout:
             _chopper_stream(
-                chopper_prog, zin, zout,
+                chopper_prog, zin, fout,
                 min_quality, min_length, max_length,
                 what=str(f),
             )
@@ -1057,7 +1066,11 @@ def main() -> None:
 
     # ---- Step 1: Chopper, pre-demux only ----
     if args.filter_stage == "pre":
-        filtered_dir = output_dir / "chopper_filtered"
+        # Intermediate and uncompressed, so it goes to node-local jobfs
+        # alongside the Minibar work dirs rather than onto /g/data.
+        filtered_dir = (Path(os.environ["PBS_JOBFS"])
+                        if os.environ.get("PBS_JOBFS")
+                        else output_dir) / "chopper_filtered"
         minibar_inputs = run_chopper(
             args.raw_input_dir, filtered_dir, args.chopper,
             args.min_quality, args.minlength, args.maxlength,
