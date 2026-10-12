@@ -1,3 +1,8 @@
+v5.05
+Date: 2026-10-12
+* Fix: correctly handle empty fastq files. 
+  Update: pre mode writing plain FASTQ to  instead of gzip level 9.
+
 v5.04
 Date: 2026-08-06
 * Change the logics: demultiplex first and then filter to catch traces of unspecific amplification.

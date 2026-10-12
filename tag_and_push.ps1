@@ -13,7 +13,8 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* Change the logics: demultiplex first and then filter to catch traces of unspecific amplification.
+* Fix: correctly handle empty fastq files. 
+  Update: pre mode writing plain FASTQ to $PBS_JOBFS instead of gzip level 9.
 "@
 
 Write-Host "Using version: $VER"
