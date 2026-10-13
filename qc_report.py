@@ -8,113 +8,93 @@ Judges only what the facility is responsible for: did each sample amplify and
 sequence into usable reads. Chimera %, classification and NTC read ratios are
 the client's responsibility and are deliberately not reported.
 
-Runs as its own PBS job after the production pipeline (run_qc_report.qsub,
-chained with qsub -W depend=afterok:<jid>). The production pipeline and its
-outputs are never modified.
+A pure reader: it never opens a FASTQ and runs no Minibar or Chopper, so it
+takes seconds. Inputs:
 
-Where the numbers come from:
+    <output_dir>/demux_qc/<SampleID>.tsv     length histogram, modal length
+    <output_dir>/demux_qc/<SampleID>.q.tsv   mean-read-Q histogram
+    <output_dir>/run_log_*/read_counts_summary.txt
+                                             delivered reads, raw_demuxed,
+                                             pct_retained, pct_pass1_kept
+    sample sheet                             Client, Sample_ID, Barcode,
+                                             optional Sample_Type / Comment
 
-    exact      delivered_reads, primer_found
-               parsed from <output_dir>/run_log_*/read_counts_summary.txt
-    estimated  retention, short_frac, long_frac, lowq_frac
-               from a diagnostic slice: Minibar (production flags) on every
-               Nth raw fastq_pass file, so the reads are seen *before*
-               Chopper. Production runs in filter_stage=pre and never sees
-               them unfiltered.
+Metrics, all exact:
 
-Steps:
+    delivered_reads  Reads in read_counts_summary.txt
+    primer_found     pct_pass1_kept
+    long_frac        1 - pct_retained. MinKNOW already drops < 1 kb and < Q15,
+                     so in post mode Chopper only removes > 2 kb reads.
+                     NA in pre mode, where Chopper ran before demux.
+    core_frac        reads in core_window / reads in 1,000-2,000 bp
+    modal_dev_bp     |modal length - run median modal length|
+    pct_q20          in-window reads with mean Q >= 20 / in-window reads
 
-    1. Select slice   every Nth raw fastq_pass file, natural name order
-    2. Minibar        on the slice, in parallel, work dirs on $PBS_JOBFS
-    3. Scan           per sample: 50 bp length histogram, integer mean-Q
-                      histogram, short / long / lowQ / pass categories
-    4. Cross-check    Chopper (production settings) on the slice raw files;
-                      its pass fraction must agree with the slice categories
-    5. Counts         read_counts_summary.txt (per-sample rows only)
-    6. Flag + write   <output_dir>/qc_report/
+Anything < 1 kb never reaches the pipeline (MinKNOW), so a short-product
+failure can only show as low delivered reads or a low core_frac.
 
---report-only skips 1-4 and rebuilds everything from the saved
-qc_report/qc_bins.tsv.gz, so thresholds can be changed in qc_config.yaml and
-re-applied without touching reads.
+Run at the end of run_script.qsub, or by hand / run_qc_report.qsub on any
+past run. Thresholds come from qc_config.yaml; change them and re-run.
 
 PASS / CHECK / FAIL is triage, not sign-off: staff review run_qc.txt and the
 heatmaps before release.
 
 Usage:
     python3 qc_report.py \\
-        --raw-input-dir /path/to/fastq_pass \\
-        --output-dir    /path/to/run_output \\
-        --primer-file   /path/to/16S_primer_setup_YYYYMMDD.txt \\
-        --samplesheet   /path/to/16s_samplesheet.csv \\
-        [--config qc_config.yaml] [--work-dir $PBS_JOBFS/qc_work]
-
-    python3 qc_report.py --report-only \\
-        --output-dir /path/to/run_output --samplesheet /path/to/sheet.csv
+        --output-dir  /path/to/run_output \\
+        --samplesheet /path/to/16s_samplesheet.csv \\
+        [--config qc_config.yaml] [--counts read_counts_summary.txt]
 """
 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import csv
 import gzip
 import hashlib
-import math
-import os
-import re
 import shutil
 import statistics
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any
 
 # Local imports: sibling modules in the same tools/ dir.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import filter_chopper_demux_minibar as core  # noqa: E402
-from demux_qc import (  # noqa: E402
-    BIN_WIDTH,
-    CATCH_ALL,
-    _ERR_PROB,
-    _open_fastq,
-    sample_id_from_path,
-)
+from demux_qc import BIN_WIDTH, CATCH_ALL, Q_HIGH  # noqa: E402
 
 log = core.log
 banner = core.banner
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "qc_config.yaml"
 
-# Mutually exclusive slice categories, in the order they are tested.
-CATEGORIES = ("short", "long", "lowq", "pass")
-
 # Metric order is also the tie-break order for reason codes.
-METRICS = ("delivered_reads", "primer_found", "retention",
-           "short_frac", "long_frac", "lowq_frac")
-ESTIMATED = ("retention", "short_frac", "long_frac", "lowq_frac")
+METRICS = ("delivered_reads", "primer_found", "long_frac", "core_frac",
+           "modal_dev_bp", "pct_q20")
+# NA below min_reads_for_stats; delivered_reads is always judged.
+STATS_METRICS = METRICS[1:]
 REASON_CODE = {
-    "delivered_reads": "READS", "primer_found": "PRIMER",
-    "retention": "RETENTION", "short_frac": "SHORT",
-    "long_frac": "LONG", "lowq_frac": "LOWQ",
+    "delivered_reads": "READS", "primer_found": "PRIMER", "long_frac": "LONG",
+    "core_frac": "LOW_CORE", "modal_dev_bp": "MODAL", "pct_q20": "LOW_Q20",
 }
 RUN_CODE = {
     "delivered_reads": "LOW_READS", "primer_found": "LOW_PRIMER",
-    "retention": "LOW_RETENTION", "short_frac": "SHORT",
-    "long_frac": "LONG", "lowq_frac": "LOW_Q",
+    "long_frac": "LONG", "core_frac": "LOW_CORE",
+    "modal_dev_bp": "MODAL_SPREAD", "pct_q20": "LOW_Q20",
 }
 LEVEL_NAME = {0: "PASS", 1: "CHECK", 2: "FAIL"}
 FLAG_ORDER = {"FAIL": 0, "CHECK": 1, "PASS": 2, "CTRL": 3}
-
-# Pseudo-sample holding run metadata inside qc_bins.tsv.gz.
-META_SAMPLE = "__run__"
 
 # MAD -> sigma for normally distributed data, so k_check/k_fail read as
 # "standard deviations from the run median".
 MAD_TO_SIGMA = 1.4826
 
-# Plot ranges. Reads beyond the top bin are clamped into it.
+# Plot ranges. Reads outside are clamped into the end bins.
+LEN_PLOT_MIN = 1000
 LEN_PLOT_MAX = 4000
+Q_PLOT_MIN = 10
 Q_PLOT_MAX = 40
 HEATMAP_MAX_ROWS = 384
 
@@ -141,11 +121,11 @@ def load_config(path: Path) -> dict[str, Any]:
             sys.exit(f"ERROR: {path}: section '{section}' is missing "
                      f"{', '.join(missing)}")
 
-    if "config_version" not in cfg:
-        sys.exit(f"ERROR: {path}: missing config_version")
-    need("filter", "min_len", "max_len", "min_q")
-    need("diagnostic_subsample", "every_nth_file", "min_reads_for_stats",
-         "crosscheck_tolerance")
+    for key in ("config_version", "min_reads_for_stats"):
+        if key not in cfg:
+            sys.exit(f"ERROR: {path}: missing {key}")
+    need("filter", "minknow_min_len", "minknow_min_q", "chopper_max_len")
+    need("core_window", "min", "max")
     need("metrics", *METRICS)
     need("run_level", "outlier_k_check", "outlier_k_fail", "mad_floor")
     need("controls", "types")
@@ -165,22 +145,23 @@ def load_config(path: Path) -> dict[str, Any]:
         if not ok:
             sys.exit(f"ERROR: {path}: metrics.{name}: fail threshold is "
                      f"less strict than check")
-    if cfg["diagnostic_subsample"]["every_nth_file"] < 1:
-        sys.exit(f"ERROR: {path}: every_nth_file must be >= 1")
+
+    f, cw = cfg["filter"], cfg["core_window"]
+    if cw["min"] % BIN_WIDTH or cw["max"] % BIN_WIDTH:
+        sys.exit(f"ERROR: {path}: core_window ends must be multiples of the "
+                 f"{BIN_WIDTH} bp demux_qc bin width, got {cw['min']}-{cw['max']}")
+    if not f["minknow_min_len"] <= cw["min"] < cw["max"] <= f["chopper_max_len"]:
+        sys.exit(f"ERROR: {path}: core_window {cw['min']}-{cw['max']} must lie "
+                 f"inside {f['minknow_min_len']}-{f['chopper_max_len']}")
+    if f["minknow_min_len"] % BIN_WIDTH or f["chopper_max_len"] % BIN_WIDTH:
+        sys.exit(f"ERROR: {path}: filter lengths must be multiples of "
+                 f"{BIN_WIDTH} bp")
 
     cfg["run_level"].setdefault("min_samples", 8)
     cfg["controls"]["types"] = [str(t).upper() for t in cfg["controls"]["types"]]
     cfg["_path"] = str(path)
     cfg["_sha256"] = hashlib.sha256(raw).hexdigest()[:12]
     return cfg
-
-
-def ordinal(n: Any) -> str:
-    """10 -> '10th', 2 -> '2nd'; anything non-integer passes through."""
-    if not isinstance(n, int):
-        return str(n)
-    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-    return f"{n}{suffix}"
 
 
 def config_label(cfg: dict[str, Any]) -> str:
@@ -206,7 +187,7 @@ def load_samplesheet(path: Path, control_types: list[str]) -> list[SheetSample]:
     Sample_Type (SAMPLE / NTC / BLANK / POS_CTRL; blank means SAMPLE).
 
     Client and Sample_ID are sanitised exactly as the pipeline does, so they
-    match the per-client folders and the sample_<id>.fastq names Minibar wrote.
+    match the per-client folders and the demux_qc/<SampleID>.tsv names.
     """
     if not path.is_file():
         sys.exit(f"ERROR: sample sheet not found: {path}")
@@ -248,9 +229,18 @@ def load_samplesheet(path: Path, control_types: list[str]) -> list[SheetSample]:
 class CountsRow:
     sample: str
     reads: int
+    raw_demuxed: int | None
     post_chopper: int | None
+    pct_retained: float | None     # percent, as printed
     pass1: int | None
     pct_pass1_kept: float | None   # percent, as printed
+
+
+@dataclass
+class Counts:
+    path: Path
+    filter_stage: str | None       # from the ' Filter stage:' header line
+    rows: dict[str, CountsRow]
 
 
 # Columns the report depends on, as they appear in the header line.
@@ -289,10 +279,15 @@ def _num(cell: str, path: Path, lineno: int, column: str) -> float | None:
                  f"{cell!r}, not a number -- has the table layout changed?")
 
 
-def parse_read_counts(path: Path) -> dict[str, CountsRow]:
+def _int(v: float | None) -> int | None:
+    return None if v is None else int(v)
+
+
+def parse_read_counts(path: Path) -> Counts:
     """
     Per-sample rows of read_counts_summary.txt, keyed by sample ID (no
-    sample_ prefix). The TOTAL rows below the second separator are ignored.
+    sample_ prefix), plus the filter stage from the header block. The TOTAL
+    rows below the second separator are ignored (known bugs).
 
     The table is fixed-width with right-aligned numeric cells, and several
     cells are legitimately blank (raw_demuxed and pct_retained in pre mode),
@@ -303,6 +298,12 @@ def parse_read_counts(path: Path) -> dict[str, CountsRow]:
     if not path.is_file():
         sys.exit(f"ERROR: read counts summary not found: {path}")
     lines = path.read_text().splitlines()
+
+    stage = None
+    for ln in lines:
+        if ln.strip().startswith("Filter stage:"):
+            stage = ln.split(":", 1)[1].strip() or None
+            break
 
     hdr_idx = next((i for i, ln in enumerate(lines)
                     if ln.startswith("Sample") and "Reads" in ln), None)
@@ -350,230 +351,124 @@ def parse_read_counts(path: Path) -> dict[str, CountsRow]:
         rows[sid] = CountsRow(
             sample=sid,
             reads=int(reads or 0),
-            post_chopper=None if cells["post_chopper"] is None
-            else int(cells["post_chopper"]),
-            pass1=None if cells["post_cutadapt_pass1"] is None
-            else int(cells["post_cutadapt_pass1"]),
+            raw_demuxed=_int(cells["raw_demuxed"]),
+            post_chopper=_int(cells["post_chopper"]),
+            pct_retained=cells["pct_retained"],
+            pass1=_int(cells["post_cutadapt_pass1"]),
             pct_pass1_kept=cells["pct_pass1_kept"],
         )
     if not rows:
         sys.exit(f"ERROR: {path}: no per-sample rows found under the header")
-    return rows
+    return Counts(path, stage, rows)
 
 
 # =============================================================================
-# Slice profiling
+# demux_qc/
 # =============================================================================
 @dataclass
-class SliceProfile:
+class DemuxProfile:
     sample_id: str
+    reads: int = 0
+    filter_stage: str = ""
+    length_window: str = ""
+    modal_length: int | None = None
     len_bins: dict[int, int] = field(default_factory=dict)  # 50 bp bin start
-    q_bins: dict[int, int] = field(default_factory=dict)    # floor(mean Q)
-    cats: dict[str, int] = field(
-        default_factory=lambda: {c: 0 for c in CATEGORIES})
-
-    @property
-    def n(self) -> int:
-        return sum(self.cats.values())
-
-    def frac(self, cat: str) -> float:
-        return self.cats.get(cat, 0) / self.n if self.n else 0.0
-
-    def merge(self, other: "SliceProfile") -> None:
-        for mine, theirs in ((self.len_bins, other.len_bins),
-                             (self.q_bins, other.q_bins),
-                             (self.cats, other.cats)):
-            for k, v in theirs.items():
-                mine[k] = mine.get(k, 0) + v
+    q_all: dict[int, int] = field(default_factory=dict)     # floor(mean Q)
+    q_win: dict[int, int] = field(default_factory=dict)     # in-window reads
+    has_q: bool = False
 
 
-def scan_slice_fastq(path: Path, sample_id: str, min_len: int, max_len: int,
-                     min_q: float) -> SliceProfile:
-    """
-    One streaming pass: length histogram, mean-Q histogram, categories.
+def _read_hist_tsv(path: Path) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """'#'-prefixed key<TAB>value header block, then a TSV table."""
+    meta: dict[str, str] = {}
+    body: list[str] = []
+    for ln in path.read_text().splitlines():
+        if ln.startswith("#"):
+            k, _, v = ln[1:].strip().partition("\t")
+            meta[k] = v
+        elif ln.strip():
+            body.append(ln)
+    return meta, list(csv.DictReader(body, delimiter="\t"))
 
-    Mean read Q is demux_qc's definition (mean per-base error probability ->
-    Phred), which is also how Chopper computes the quality it filters on.
-    Categories are exclusive and tested in order:
-        length < min_len -> short; length > max_len -> long;
-        mean Q < min_q   -> lowq;  else pass.
-    """
-    prof = SliceProfile(sample_id)
-    lens, qs, cats = prof.len_bins, prof.q_bins, prof.cats
-    err_prob = _ERR_PROB.__getitem__
-    with _open_fastq(path) as fh:
-        readline = fh.readline
-        while True:
-            if not readline():
-                break
-            seq = readline().rstrip()
-            plus = readline()
-            qual = readline()
-            if not plus or not qual:
-                break                      # truncated final record
-            qual = qual.rstrip()
 
-            length = len(seq)
-            b = (length // BIN_WIDTH) * BIN_WIDTH
-            lens[b] = lens.get(b, 0) + 1
-
-            q = None
-            if qual:
-                mean_err = sum(map(err_prob, qual)) / len(qual)
-                q = -10.0 * math.log10(mean_err) if mean_err > 0 else 93.0
-                qb = int(q)
-                qs[qb] = qs.get(qb, 0) + 1
-
-            if length < min_len:
-                cats["short"] += 1
-            elif length > max_len:
-                cats["long"] += 1
-            elif q is None or q < min_q:
-                cats["lowq"] += 1
-            else:
-                cats["pass"] += 1
+def read_demux_profile(qc_dir: Path, sid: str) -> DemuxProfile | None:
+    path = qc_dir / f"{sid}.tsv"
+    if not path.is_file():
+        return None
+    meta, rows = _read_hist_tsv(path)
+    for col in ("bin_start", "count"):
+        if rows and col not in rows[0]:
+            sys.exit(f"ERROR: {path}: missing column '{col}'")
+    bw = meta.get("bin_width_bp")
+    if bw is not None and int(bw) != BIN_WIDTH:
+        sys.exit(f"ERROR: {path}: bin width {bw} bp, expected {BIN_WIDTH}")
+    reads = int(meta.get("reads", 0))
+    prof = DemuxProfile(
+        sample_id=sid,
+        reads=reads,
+        filter_stage=meta.get("filter_stage", ""),
+        length_window=meta.get("length_window", ""),
+        modal_length=int(meta["modal_length"]) if reads and "modal_length" in meta
+        else None,
+        len_bins={int(r["bin_start"]): int(r["count"]) for r in rows
+                  if int(r["count"])},
+    )
+    qpath = qc_dir / f"{sid}.q.tsv"
+    if qpath.is_file():
+        _, qrows = _read_hist_tsv(qpath)
+        for col in ("q_bin", "count_all", "count_in_window"):
+            if qrows and col not in qrows[0]:
+                sys.exit(f"ERROR: {qpath}: missing column '{col}'")
+        prof.q_all = {int(r["q_bin"]): int(r["count_all"]) for r in qrows
+                      if int(r["count_all"])}
+        prof.q_win = {int(r["q_bin"]): int(r["count_in_window"]) for r in qrows
+                      if int(r["count_in_window"])}
+        prof.has_q = True
     return prof
 
 
-def natural_key(path: Path) -> list[Any]:
-    """'x_10.fastq.gz' after 'x_9.fastq.gz', so every Nth file is spread
-    evenly over the run instead of clustering on lexical runs of digits."""
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", path.name)]
-
-
-def select_slice(raw_input_dir: Path, every_nth: int) -> tuple[list[Path], int]:
-    inputs = sorted(raw_input_dir.glob("*.fastq.gz"), key=natural_key)
-    if not inputs:
-        sys.exit(f"ERROR: no *.fastq.gz files found in {raw_input_dir}")
-    return inputs[::every_nth], len(inputs)
-
-
-def _scan_chunk_dir(chunk_dir: Path, min_len: int, max_len: int,
-                    min_q: float) -> dict[str, SliceProfile]:
-    """Worker: profile every sample_*.fastq Minibar wrote for one chunk."""
-    out = {}
-    for fq in sorted(chunk_dir.glob("sample_*.fastq")):
-        sid = sample_id_from_path(fq)
-        out[sid] = scan_slice_fastq(fq, sid, min_len, max_len, min_q)
-    return out
-
-
-def profile_slice(chunk_dirs: list[Path], cfg: dict[str, Any],
-                  workers: int) -> dict[str, SliceProfile]:
-    """Scan every chunk's per-sample output and merge across chunks.
-
-    Pure-Python per-base work, so it uses processes rather than threads.
-    """
-    banner("QC STEP 3: Profiling slice reads")
-    f = cfg["filter"]
-    profiles: dict[str, SliceProfile] = {}
-    n = max(1, min(workers, len(chunk_dirs)))
-    with concurrent.futures.ProcessPoolExecutor(max_workers=n) as ex:
-        futs = [ex.submit(_scan_chunk_dir, d, f["min_len"], f["max_len"],
-                          f["min_q"]) for d in chunk_dirs]
-        for fut in futs:
-            for sid, prof in fut.result().items():
-                profiles.setdefault(sid, SliceProfile(sid)).merge(prof)
-    total = sum(p.n for p in profiles.values())
-    log(f" {len(profiles)} bin(s), {total:,} slice reads profiled")
-    log("========================================")
+def load_demux_qc(qc_dir: Path, sample_ids: list[str],
+                  warnings: list[str]) -> dict[str, DemuxProfile]:
+    if not qc_dir.is_dir():
+        sys.exit(f"ERROR: demux QC dir not found: {qc_dir} -- was the run "
+                 f"made with --no-demux-qc? Pass --demux-qc-dir if it moved.")
+    profiles: dict[str, DemuxProfile] = {}
+    no_q = []
+    for sid in [*sample_ids, *CATCH_ALL]:
+        prof = read_demux_profile(qc_dir, sid)
+        if prof is None:
+            continue
+        profiles[sid] = prof
+        if not prof.has_q and sid not in CATCH_ALL:
+            no_q.append(sid)
+    if no_q:
+        warnings.append(
+            f"{len(no_q)} sample(s) have no <SampleID>.q.tsv (demux_qc.py "
+            f"predates the Q histogram); pct_q20 is NA for them")
     return profiles
 
 
 # =============================================================================
-# Chopper cross-check
+# Metrics from histograms
 # =============================================================================
-class _CountingReader:
-    """File-like wrapper that counts newlines as Chopper's feeder reads."""
-
-    def __init__(self, fh: BinaryIO) -> None:
-        self.fh = fh
-        self.lines = 0
-
-    def read(self, n: int = -1) -> bytes:
-        data = self.fh.read(n)
-        self.lines += data.count(b"\n")
-        return data
+def core_frac(prof: DemuxProfile, cfg: dict[str, Any]) -> float | None:
+    """Reads in core_window / reads in the delivered length window, both
+    half-open on 50 bp bin starts (a read of exactly chopper_max_len bp falls
+    in the next bin and is left out of both)."""
+    f, cw = cfg["filter"], cfg["core_window"]
+    den = sum(n for b, n in prof.len_bins.items()
+              if f["minknow_min_len"] <= b < f["chopper_max_len"])
+    num = sum(n for b, n in prof.len_bins.items() if cw["min"] <= b < cw["max"])
+    return num / den if den else None
 
 
-class _CountingSink:
-    """Discards Chopper's output, keeping only its line count."""
-
-    def __init__(self) -> None:
-        self.lines = 0
-
-    def write(self, data: bytes) -> int:
-        self.lines += data.count(b"\n")
-        return len(data)
-
-
-def _chopper_count(raw: Path, chopper: Path, f: dict[str, Any]) -> tuple[int, int]:
-    with gzip.open(raw, "rb") as zin:
-        src, dst = _CountingReader(zin), _CountingSink()
-        core._chopper_stream(chopper, src, dst, f["min_q"], f["min_len"],
-                             f["max_len"], what=str(raw))
-    return src.lines // 4, dst.lines // 4
-
-
-def run_crosscheck(slice_files: list[Path], chopper: Path,
-                   cfg: dict[str, Any], workers: int) -> tuple[int, int]:
-    """Production Chopper settings on the slice raw files -> (reads_in,
-    reads_out). Chopper is itself multi-threaded, so fewer workers."""
-    banner("QC STEP 4: Chopper cross-check on slice raw files")
-    n = max(1, min(workers // 4 or 1, len(slice_files)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
-        res = list(ex.map(lambda p: _chopper_count(p, chopper, cfg["filter"]),
-                          slice_files))
-    n_in = sum(a for a, _ in res)
-    n_out = sum(b for _, b in res)
-    log(f" Chopper kept {n_out:,} of {n_in:,} slice reads")
-    log("========================================")
-    return n_in, n_out
-
-
-# =============================================================================
-# qc_bins.tsv.gz
-# =============================================================================
-def write_bins(path: Path, profiles: dict[str, SliceProfile],
-               meta: dict[str, int]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, "wt", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
-        w.writerow(["sample", "kind", "bin", "count"])
-        for k, v in meta.items():
-            w.writerow([META_SAMPLE, "meta", k, v])
-        for sid in sorted(profiles):
-            p = profiles[sid]
-            for c in CATEGORIES:
-                w.writerow([sid, "category", c, p.cats.get(c, 0)])
-            for b in sorted(p.len_bins):
-                w.writerow([sid, "len", b, p.len_bins[b]])
-            for b in sorted(p.q_bins):
-                w.writerow([sid, "q", b, p.q_bins[b]])
-
-
-def read_bins(path: Path) -> tuple[dict[str, SliceProfile], dict[str, int]]:
-    if not path.is_file():
-        sys.exit(f"ERROR: {path} not found -- --report-only needs a previous "
-                 f"full run of qc_report.py on this output dir")
-    profiles: dict[str, SliceProfile] = {}
-    meta: dict[str, int] = {}
-    with gzip.open(path, "rt", newline="") as fh:
-        for row in csv.DictReader(fh, delimiter="\t"):
-            sid, kind, b, n = row["sample"], row["kind"], row["bin"], int(row["count"])
-            if kind == "meta":
-                meta[b] = n
-                continue
-            p = profiles.setdefault(sid, SliceProfile(sid))
-            if kind == "category":
-                p.cats[b] = n
-            elif kind == "len":
-                p.len_bins[int(b)] = n
-            elif kind == "q":
-                p.q_bins[int(b)] = n
-            else:
-                sys.exit(f"ERROR: {path}: unknown kind {kind!r}")
-    return profiles, meta
+def pct_q20(prof: DemuxProfile) -> float | None:
+    """In-window reads at mean Q >= Q_HIGH, as a fraction. q bins are
+    floor(Q), so bin >= 20 is exactly Q >= 20."""
+    tot = sum(prof.q_win.values())
+    if not prof.has_q or not tot:
+        return None
+    return sum(n for q, n in prof.q_win.items() if q >= Q_HIGH) / tot
 
 
 # =============================================================================
@@ -582,7 +477,9 @@ def read_bins(path: Path) -> tuple[dict[str, SliceProfile], dict[str, int]]:
 @dataclass
 class SampleResult:
     sample: SheetSample
-    slice_n: int
+    n: int                                               # raw demuxed reads
+    raw_demuxed: int | None
+    modal_length: int | None
     values: dict[str, float | None]
     na: dict[str, str] = field(default_factory=dict)     # metric -> NA text
     levels: dict[str, int] = field(default_factory=dict)
@@ -601,6 +498,14 @@ class MetricRun:
     relative: bool = False
 
 
+@dataclass
+class Evaluation:
+    results: list[SampleResult]
+    runs: list[MetricRun]
+    filter_stage: str
+    modal_median: float | None
+
+
 def abs_level(value: float, spec: dict[str, Any]) -> int:
     if spec["direction"] == "higher_better":
         return 2 if value < spec["fail"] else 1 if value < spec["check"] else 0
@@ -610,46 +515,83 @@ def abs_level(value: float, spec: dict[str, Any]) -> int:
 def fmt_value(metric: str, value: float) -> str:
     if metric == "delivered_reads":
         return f"{int(value):,}"
+    if metric == "modal_dev_bp":
+        return f"{value:.0f}bp"
     return f"{100 * value:.0f}%"
 
 
-def evaluate(sheet: list[SheetSample], counts: dict[str, CountsRow],
-             profiles: dict[str, SliceProfile], cfg: dict[str, Any],
-             warnings: list[str]) -> tuple[list[SampleResult], list[MetricRun]]:
-    min_n = cfg["diagnostic_subsample"]["min_reads_for_stats"]
+def resolve_filter_stage(counts: Counts, profiles: dict[str, DemuxProfile],
+                         warnings: list[str]) -> str:
+    """Counts header first, demux_qc headers as a fallback; warn on any
+    disagreement. 'pre' or 'post'."""
+    demux = {p.filter_stage for p in profiles.values() if p.filter_stage}
+    stage = counts.filter_stage or (demux.pop() if len(demux) == 1 else None)
+    if stage is None:
+        # Pre mode is the only one that leaves pct_retained blank everywhere.
+        any_ret = any(r.pct_retained is not None for r in counts.rows.values())
+        stage = "post" if any_ret else "pre"
+        warnings.append(f"filter stage not recorded; inferred '{stage}' from "
+                        f"the pct_retained column")
+    elif demux and demux != {stage}:
+        warnings.append(f"read_counts_summary.txt says filter stage '{stage}' "
+                        f"but demux_qc/ says {', '.join(sorted(demux))}")
+    if stage not in ("pre", "post"):
+        sys.exit(f"ERROR: unknown filter stage {stage!r} in {counts.path}")
+    return stage
+
+
+def evaluate(sheet: list[SheetSample], counts: Counts,
+             profiles: dict[str, DemuxProfile], cfg: dict[str, Any],
+             warnings: list[str]) -> Evaluation:
+    min_n = cfg["min_reads_for_stats"]
     rl = cfg["run_level"]
     controls = set(cfg["controls"]["types"])
+    stage = resolve_filter_stage(counts, profiles, warnings)
 
     results: list[SampleResult] = []
     for s in sheet:
-        row = counts.get(s.sample_id)
+        row = counts.rows.get(s.sample_id)
         prof = profiles.get(s.sample_id)
-        n = prof.n if prof else 0
-        values: dict[str, float | None] = {}
+        values: dict[str, float | None] = dict.fromkeys(METRICS)
         na: dict[str, str] = {}
 
         if row is None:
             warnings.append(f"{s.sample_id}: not in read_counts_summary.txt; "
                             f"delivered_reads taken as 0")
+        if prof is None:
+            warnings.append(f"{s.sample_id}: no demux_qc/{s.sample_id}.tsv "
+                            f"(no reads demultiplexed?)")
         values["delivered_reads"] = row.reads if row else 0
-        if row is not None and row.pct_pass1_kept is not None:
-            values["primer_found"] = row.pct_pass1_kept / 100.0
-        else:
-            values["primer_found"] = None
-            na["primer_found"] = "NA"
+        # Post mode: raw_demuxed. Pre mode has none; demux_qc then saw the
+        # Chopper-filtered reads, which is the best count available.
+        raw = row.raw_demuxed if row else None
+        n = raw if raw is not None else (prof.reads if prof else 0)
 
         if n < min_n:
-            for m in ESTIMATED:
-                values[m] = None
+            for m in STATS_METRICS:
                 na[m] = f"NA (n<{min_n})"
         else:
-            values["retention"] = prof.frac("pass")
-            values["short_frac"] = prof.frac("short")
-            values["long_frac"] = prof.frac("long")
-            values["lowq_frac"] = prof.frac("lowq")
-        results.append(SampleResult(s, n, values, na))
+            if row is not None and row.pct_pass1_kept is not None:
+                values["primer_found"] = row.pct_pass1_kept / 100.0
+            if stage == "pre":
+                na["long_frac"] = "NA (pre mode)"
+            elif row is not None and row.pct_retained is not None:
+                values["long_frac"] = 1.0 - row.pct_retained / 100.0
+            if prof is not None:
+                values["core_frac"] = core_frac(prof, cfg)
+                values["pct_q20"] = pct_q20(prof)
+        modal = prof.modal_length if prof and n >= min_n else None
+        results.append(SampleResult(s, n, raw, modal, values, na))
 
     real = [r for r in results if r.sample.sample_type not in controls]
+
+    # modal_dev_bp: distance from the run's median modal length.
+    modals = [r.modal_length for r in real if r.modal_length is not None]
+    modal_median = statistics.median(modals) if modals else None
+    if modal_median is not None:
+        for r in results:
+            if r.modal_length is not None:
+                r.values["modal_dev_bp"] = abs(r.modal_length - modal_median)
 
     runs: list[MetricRun] = []
     for m in METRICS:
@@ -705,12 +647,12 @@ def evaluate(sheet: list[SheetSample], counts: dict[str, CountsRow],
             parts.append(f"{REASON_CODE[m]}({txt})")
         if parts:
             r.reasons = f"{r.flag}: " + ";".join(parts)
-        elif r.slice_n < min_n:
-            r.reasons = f"estimates NA (slice n={r.slice_n})"
-    return results, runs
+        elif r.n < min_n:
+            r.reasons = f"stats NA (n={r.n})"
+    return Evaluation(results, runs, stage, modal_median)
 
 
-def run_flag_lines(runs: list[MetricRun], cfg: dict[str, Any]) -> list[str]:
+def run_flag_lines(runs: list[MetricRun]) -> list[str]:
     out = []
     for mr in runs:
         if not mr.run_level:
@@ -726,15 +668,19 @@ def run_flag_lines(runs: list[MetricRun], cfg: dict[str, Any]) -> list[str]:
 # =============================================================================
 # Outputs
 # =============================================================================
-_TSV_COLUMNS = ["client", "sample", "barcode", "location", "type", "slice_n",
-                *METRICS, "flag", "reasons", "comment"]
+_TSV_COLUMNS = ["client", "sample", "barcode", "location", "type",
+                "raw_demuxed", "delivered_reads", "primer_found", "long_frac",
+                "core_frac", "modal_length", "modal_dev_bp", "pct_q20",
+                "flag", "reasons", "comment"]
 
 
 def _cell(r: SampleResult, m: str) -> str:
     v = r.values[m]
     if v is None:
         return r.na.get(m, "NA")
-    return str(int(v)) if m == "delivered_reads" else f"{v:.4f}"
+    if m in ("delivered_reads", "modal_dev_bp"):
+        return str(int(round(v)))
+    return f"{v:.4f}"
 
 
 def write_sample_tsv(path: Path, results: list[SampleResult],
@@ -747,88 +693,92 @@ def write_sample_tsv(path: Path, results: list[SampleResult],
         w.writerow(_TSV_COLUMNS)
         for r in results:
             s = r.sample
+            vals = {m: _cell(r, m) for m in METRICS}
             w.writerow([s.client, s.sample_id, s.barcode, s.location,
-                        s.sample_type, r.slice_n,
-                        *(_cell(r, m) for m in METRICS),
+                        s.sample_type,
+                        "" if r.raw_demuxed is None else r.raw_demuxed,
+                        vals["delivered_reads"], vals["primer_found"],
+                        vals["long_frac"], vals["core_frac"],
+                        "" if r.modal_length is None else r.modal_length,
+                        vals["modal_dev_bp"], vals["pct_q20"],
                         r.flag, r.reasons, s.comment])
 
 
-def tsv_header(cfg: dict[str, Any], meta: dict[str, int],
-               runs: list[MetricRun]) -> list[str]:
+def _stage_note(stage: str) -> str:
+    if stage == "post":
+        return "post (demultiplexed before Chopper; > 2 kb reads visible)"
+    return ("pre (Chopper ran before demultiplexing): long_frac is NA and "
+            "raw_demuxed is blank")
+
+
+def tsv_header(cfg: dict[str, Any], ev: Evaluation) -> list[str]:
+    f, cw = cfg["filter"], cfg["core_window"]
     lines = [
         f"generated\t{datetime.now():%Y-%m-%d %H:%M:%S}",
         f"config_version\t{config_label(cfg)}",
-        f"slice\t{meta.get('slice_files', 0)} of {meta.get('total_files', 0)} "
-        f"raw files (every {ordinal(meta.get('every_nth_file', '?'))})",
-        f"exact_columns\tdelivered_reads, primer_found "
-        f"(from read_counts_summary.txt)",
-        f"estimated_columns\t{', '.join(ESTIMATED)} "
-        f"(from the diagnostic slice, before Chopper)",
-        "fractions\t0-1; NA (n<N) = too few slice reads to estimate",
+        f"filter_stage\t{_stage_note(ev.filter_stage)}",
+        f"delivered_window\t{f['minknow_min_len']}-{f['chopper_max_len']} bp, "
+        f"mean Q >= {f['minknow_min_q']}",
+        f"core_window\t{cw['min']}-{cw['max']} bp",
+        f"run_median_modal_length\t"
+        f"{'NA' if ev.modal_median is None else f'{ev.modal_median:.0f}'}",
+        f"fractions\t0-1; NA (n<{cfg['min_reads_for_stats']}) = too few "
+        f"raw demuxed reads",
     ]
-    lines += [f"run_flag\t{ln}" for ln in run_flag_lines(runs, cfg)]
+    lines += [f"run_flag\t{ln}" for ln in run_flag_lines(ev.runs)]
     return lines
 
 
-def write_run_qc(path: Path, args: argparse.Namespace, cfg: dict[str, Any],
-                 counts_path: Path, results: list[SampleResult],
-                 runs: list[MetricRun], profiles: dict[str, SliceProfile],
-                 meta: dict[str, int], warnings: list[str]) -> None:
-    f = cfg["filter"]
-    tol = cfg["diagnostic_subsample"]["crosscheck_tolerance"]
-    total_slice = sum(p.n for p in profiles.values())
-    slice_pass = sum(p.cats.get("pass", 0) for p in profiles.values())
+def write_bins(path: Path, profiles: dict[str, DemuxProfile]) -> None:
+    """Long format for re-plotting / re-thresholding. kind: len (50 bp bin
+    start, all reads), q (floor mean Q, in-window reads), q_all (all reads)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        w.writerow(["sample", "kind", "bin", "count"])
+        for sid in sorted(profiles):
+            p = profiles[sid]
+            for kind, bins in (("len", p.len_bins), ("q", p.q_win),
+                               ("q_all", p.q_all)):
+                for b in sorted(bins):
+                    w.writerow([sid, kind, b, bins[b]])
 
+
+def write_run_qc(path: Path, args: argparse.Namespace, cfg: dict[str, Any],
+                 counts: Counts, ev: Evaluation,
+                 profiles: dict[str, DemuxProfile], warnings: list[str]) -> None:
+    f, cw = cfg["filter"], cfg["core_window"]
+    results, runs = ev.results, ev.runs
     L = [
         "========================================",
         " Per-sample QC report -- run summary",
-        f" Generated:  {datetime.now():%Y-%m-%d %H:%M:%S}",
-        f" Output dir: {args.output_dir}",
-        f" Counts:     {counts_path}",
-        f" Config:     {cfg['_path']}",
-        f" Version:    {config_label(cfg)}",
-        f" Mode:       {'report-only (rebuilt from qc_bins.tsv.gz)' if args.report_only else 'full'}",
+        f" Generated:    {datetime.now():%Y-%m-%d %H:%M:%S}",
+        f" Output dir:   {args.output_dir}",
+        f" Counts:       {counts.path}",
+        f" Demux QC:     {args.demux_qc_dir}",
+        f" Config:       {cfg['_path']}",
+        f" Version:      {config_label(cfg)}",
+        f" Filter stage: {_stage_note(ev.filter_stage)}",
         "========================================",
-        "",
-        " Diagnostic slice",
-        f"   files:   {meta.get('slice_files', 0)} of {meta.get('total_files', 0)} "
-        f"raw fastq_pass files (every {ordinal(meta.get('every_nth_file', '?'))}, "
-        f"natural name order)"
-        + (f", {meta['empty_files']} empty skipped" if meta.get("empty_files") else ""),
-        f"   reads:   {total_slice:,} demultiplexed (all bins)",
-        f"   filter:  {meta.get('min_len', f['min_len'])}-"
-        f"{meta.get('max_len', f['max_len'])} bp, mean Q >= "
-        f"{meta.get('min_q', f['min_q'])}",
-        "",
-        " Chopper cross-check",
     ]
-    if "chopper_in" in meta and meta["chopper_in"]:
-        c_frac = meta["chopper_out"] / meta["chopper_in"]
-        s_frac = slice_pass / total_slice if total_slice else 0.0
-        diff = abs(c_frac - s_frac)
-        verdict = "OK" if diff <= tol else "WARNING"
-        L += [
-            f"   Chopper pass fraction (slice raw):  {c_frac:.4f}  "
-            f"({meta['chopper_out']:,} / {meta['chopper_in']:,})",
-            f"   slice category pass fraction:       {s_frac:.4f}  "
-            f"({slice_pass:,} / {total_slice:,})",
-            f"   difference: {diff:.4f} (tolerance {tol}) -> {verdict}",
-        ]
-        if verdict == "WARNING":
-            warnings.append(
-                f"Chopper cross-check differs by {diff:.4f} (> {tol}): the "
-                f"slice categories may not mirror production Chopper; check "
-                f"the filter section of the config against run_script.qsub")
-        if meta["chopper_in"] != total_slice:
-            warnings.append(
-                f"slice raw files hold {meta['chopper_in']:,} reads but Minibar "
-                f"binned {total_slice:,}; estimates may be biased")
-    else:
-        L.append("   not run")
+    if ev.filter_stage == "pre":
+        L += ["",
+              " NOTE: pre-mode run. Chopper filtered the reads before Minibar,",
+              " so reads > 2 kb were never demultiplexed: long_frac is NA for",
+              " every sample and the length heatmap shows no > 2 kb tail."]
+    L += [
+        "",
+        " Windows",
+        f"   delivered:  {f['minknow_min_len']}-{f['chopper_max_len']} bp "
+        f"(MinKNOW >= {f['minknow_min_len']} bp, Q{f['minknow_min_q']}; "
+        f"Chopper <= {f['chopper_max_len']} bp)",
+        f"   core:       {cw['min']}-{cw['max']} bp",
+        f"   run median modal length: "
+        f"{'NA' if ev.modal_median is None else f'{ev.modal_median:.0f} bp'}",
+    ]
 
     L += ["", " Run-level flags"]
-    flags = run_flag_lines(runs, cfg)
-    L += [f"   {ln}" for ln in flags] or ["   none"]
+    L += [f"   {ln}" for ln in run_flag_lines(runs)] or ["   none"]
 
     L += ["", " Run medians (real samples, controls excluded)",
           f"   {'metric':<17} {'median':>9} {'MAD':>9} {'n':>5}  mode"]
@@ -836,8 +786,9 @@ def write_run_qc(path: Path, args: argparse.Namespace, cfg: dict[str, Any],
         if mr.median is None:
             L.append(f"   {mr.metric:<17} {'NA':>9} {'NA':>9} {0:>5}  -")
             continue
-        fmt = (lambda v: f"{v:,.0f}") if mr.metric == "delivered_reads" \
-            else (lambda v: f"{v:.4f}")
+        fmt = ((lambda v: f"{v:,.0f}")
+               if mr.metric in ("delivered_reads", "modal_dev_bp")
+               else (lambda v: f"{v:.4f}"))
         L.append(f"   {mr.metric:<17} {fmt(mr.median):>9} {fmt(mr.mad):>9} "
                  f"{mr.n:>5}  {'relative' if mr.relative else 'absolute'}")
 
@@ -845,20 +796,14 @@ def write_run_qc(path: Path, args: argparse.Namespace, cfg: dict[str, Any],
     for flag in ("PASS", "CHECK", "FAIL", "CTRL"):
         L.append(f"   {flag:<6} {sum(r.flag == flag for r in results):>5}")
 
-    L += ["", " Catch-all bins (slice)"]
+    # Share of all demultiplexed reads, from demux_qc (raw in post mode).
+    total = sum(p.reads for p in profiles.values())
+    L += ["", " Catch-all bins (share of all demultiplexed reads)"]
     for sid in CATCH_ALL:
         p = profiles.get(sid)
-        if not p or not p.n:
-            L.append(f"   {sid:<17} 0 reads")
-            continue
-        share = 100.0 * p.n / total_slice if total_slice else 0.0
-        L.append(f"   {sid:<17} {p.n:,} reads ({share:.1f}% of slice): "
-                 + ", ".join(f"{c} {100 * p.frac(c):.1f}%" for c in CATEGORIES))
-
-    known = {s.sample.sample_id for s in results} | set(CATCH_ALL)
-    stray = sorted(sid for sid, p in profiles.items() if sid not in known and p.n)
-    if stray:
-        warnings.append(f"slice bins not in the sample sheet: {', '.join(stray)}")
+        n = p.reads if p else 0
+        share = 100.0 * n / total if total else 0.0
+        L.append(f"   {sid:<17} {n:>10,} reads  {share:5.1f}%")
 
     L += ["", " Warnings"]
     L += [f"   - {w}" for w in warnings] or ["   none"]
@@ -883,32 +828,71 @@ _INK = "#0b0b0b"
 _INK2 = "#52514e"
 _MUTED = "#898781"
 _EMPTY = "#e1e0d9"
+_GUIDE = "#d03b3b"
 
 
-def _matrix(rows: list[SampleResult], profiles: dict[str, SliceProfile],
+def _plot_bins(prof: DemuxProfile | None, kind: str) -> dict[int, int]:
+    """Histogram clamped into the plot range, keyed by bin start."""
+    if prof is None:
+        return {}
+    if kind == "len":
+        lo, hi, src = LEN_PLOT_MIN, LEN_PLOT_MAX, prof.len_bins
+    else:
+        lo, hi, src = Q_PLOT_MIN, Q_PLOT_MAX, prof.q_win
+    out: dict[int, int] = {}
+    for b, n in src.items():
+        k = min(max(b, lo), hi)
+        out[k] = out.get(k, 0) + n
+    return out
+
+
+def _edges(kind: str) -> list[int]:
+    if kind == "len":
+        return list(range(LEN_PLOT_MIN, LEN_PLOT_MAX + BIN_WIDTH, BIN_WIDTH))
+    return list(range(Q_PLOT_MIN, Q_PLOT_MAX + 1))
+
+
+def _matrix(rows: list[SampleResult], profiles: dict[str, DemuxProfile],
             kind: str) -> tuple[Any, list[int]]:
     import numpy as np
-    if kind == "len":
-        edges = list(range(0, LEN_PLOT_MAX + BIN_WIDTH, BIN_WIDTH))
-    else:
-        edges = list(range(0, Q_PLOT_MAX + 1))
-    top = edges[-1]
+    edges = _edges(kind)
     step = edges[1] - edges[0]
     mat = np.full((len(rows), len(edges)), np.nan)
     for i, r in enumerate(rows):
-        p = profiles.get(r.sample.sample_id)
-        bins = (p.len_bins if kind == "len" else p.q_bins) if p else {}
+        bins = _plot_bins(profiles.get(r.sample.sample_id), kind)
         tot = sum(bins.values())
         if not tot:
             continue
         mat[i, :] = 0.0
         for b, n in bins.items():
-            mat[i, min(b, top) // step] += n / tot
+            mat[i, (b - edges[0]) // step] += n / tot
     return mat, edges
 
 
+def _guides(ax: Any, cfg: dict[str, Any], kind: str) -> None:
+    f, cw = cfg["filter"], cfg["core_window"]
+    if kind == "len":
+        ax.axvspan(cw["min"], cw["max"], color=_INK, alpha=0.08, lw=0)
+        ax.axvline(f["chopper_max_len"], color=_GUIDE, lw=1.0)
+    else:
+        ax.axvline(Q_HIGH, color=_GUIDE, lw=1.0)
+        ax.axvline(f["minknow_min_q"], color=_INK2, lw=0.8, ls="--")
+
+
+def _xlabel(cfg: dict[str, Any], kind: str) -> str:
+    f, cw = cfg["filter"], cfg["core_window"]
+    if kind == "len":
+        return (f"Read length (bp, {BIN_WIDTH} bp bins; end bins hold "
+                f"< {LEN_PLOT_MIN} / >= {LEN_PLOT_MAX}). Band = core window "
+                f"{cw['min']}-{cw['max']} bp; red line = Chopper max "
+                f"{f['chopper_max_len']} bp")
+    return (f"Mean read Q of reads in {f['minknow_min_len']}-"
+            f"{f['chopper_max_len']} bp (integer bins; end bins clamped). "
+            f"Red = Q{Q_HIGH}; dashed = MinKNOW Q{f['minknow_min_q']}")
+
+
 def plot_heatmap(path: Path, rows: list[SampleResult],
-                 profiles: dict[str, SliceProfile], cfg: dict[str, Any],
+                 profiles: dict[str, DemuxProfile], cfg: dict[str, Any],
                  kind: str, title: str) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap, ListedColormap
@@ -949,32 +933,20 @@ def plot_heatmap(path: Path, rows: list[SampleResult],
                    interpolation="nearest", cmap=cmap, vmin=0,
                    vmax=max(0.05, float(np.nanmax(mat)) if np.isfinite(mat).any() else 1),
                    extent=extent)
-    f = cfg["filter"]
-    if kind == "len":
-        ax.axvspan(f["min_len"], f["max_len"] + 1, color=_INK, alpha=0.06, lw=0)
-        for x in (f["min_len"], f["max_len"] + 1):
-            ax.axvline(x, color=_INK2, lw=0.8)
-        ax.set_xlabel(f"Read length (bp, {BIN_WIDTH} bp bins; "
-                      f">= {LEN_PLOT_MAX} in last bin). "
-                      f"Band = Chopper window {f['min_len']}-{f['max_len']} bp",
-                      color=_INK2, fontsize=8)
-    else:
-        ax.axvline(f["min_q"], color=_INK2, lw=1.0, ls="--")
-        ax.set_xlabel(f"Mean read Q (integer bins; >= {Q_PLOT_MAX} in last bin). "
-                      f"Dashed = Chopper min Q{f['min_q']}",
-                      color=_INK2, fontsize=8)
+    _guides(ax, cfg, kind)
+    ax.set_xlabel(_xlabel(cfg, kind), color=_INK2, fontsize=8)
     ax.tick_params(axis="y", left=False, labelleft=False)
     ax.tick_params(axis="x", colors=_MUTED, labelsize=7)
     for sp in ax.spines.values():
         sp.set_color("#c3c2b7")
 
     cb = fig.colorbar(im, cax=ax_cb)
-    cb.set_label("Fraction of the sample's slice reads", color=_INK2, fontsize=7)
+    cb.set_label("Fraction of the sample's reads", color=_INK2, fontsize=7)
     cb.ax.tick_params(labelsize=6, colors=_MUTED)
     cb.outline.set_visible(False)
 
     handles = [Patch(color=_FLAG_COLOUR[k], label=k) for k in flag_names]
-    handles.append(Patch(color=_EMPTY, label="no slice reads"))
+    handles.append(Patch(color=_EMPTY, label="no data"))
     fig.legend(handles=handles, loc="upper right", ncol=len(handles),
                fontsize=7, frameon=False, bbox_to_anchor=(0.94, 1 - 0.1 / height))
     fig.text(0.16, 1 - 0.35 / height, title, fontsize=10, color=_INK,
@@ -983,38 +955,30 @@ def plot_heatmap(path: Path, rows: list[SampleResult],
     plt.close(fig)
 
 
-def plot_flagged(path: Path, r: SampleResult, prof: SliceProfile | None,
+def plot_flagged(path: Path, r: SampleResult, prof: DemuxProfile | None,
                  cfg: dict[str, Any]) -> None:
     import matplotlib.pyplot as plt
 
-    f = cfg["filter"]
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 3.4), facecolor="#fcfcfb")
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.4), facecolor="#fcfcfb")
     colour = "#2a78d6"
-    if prof and prof.n:
-        # Same ranges and top-bin clamping as the heatmaps.
-        lens: dict[int, int] = {}
-        for b, c in prof.len_bins.items():
-            lens[min(b, LEN_PLOT_MAX)] = lens.get(min(b, LEN_PLOT_MAX), 0) + c
-        qs: dict[int, int] = {}
-        for b, c in prof.q_bins.items():
-            qs[min(b, Q_PLOT_MAX)] = qs.get(min(b, Q_PLOT_MAX), 0) + c
-        a1.bar(list(lens), [c / prof.n for c in lens.values()],
-               width=BIN_WIDTH * 0.9, align="edge", color=colour, lw=0)
-        a2.bar(list(qs), [c / prof.n for c in qs.values()], width=0.9,
-               align="edge", color=colour, lw=0)
-    else:
-        for a in (a1, a2):
-            a.text(0.5, 0.5, "no slice reads", transform=a.transAxes,
+    for a, kind in zip(axes, ("len", "q")):
+        bins = _plot_bins(prof, kind)
+        tot = sum(bins.values())
+        edges = _edges(kind)
+        step = edges[1] - edges[0]
+        if tot:
+            a.bar(list(bins), [c / tot for c in bins.values()],
+                  width=step * 0.9, align="edge", color=colour, lw=0)
+        else:
+            a.text(0.5, 0.5, "no data", transform=a.transAxes,
                    ha="center", color=_MUTED)
-    a1.axvspan(f["min_len"], f["max_len"] + 1, color=_INK, alpha=0.06, lw=0)
-    a1.set_xlabel(f"Read length (bp); band = {f['min_len']}-{f['max_len']} bp",
-                  fontsize=8, color=_INK2)
-    a1.set_xlim(0, LEN_PLOT_MAX + BIN_WIDTH)
-    a2.axvline(f["min_q"], color=_INK2, lw=1.0, ls="--")
-    a2.set_xlabel(f"Mean read Q; dashed = Q{f['min_q']}", fontsize=8, color=_INK2)
-    a2.set_xlim(0, Q_PLOT_MAX + 1)
-    for a in (a1, a2):
-        a.set_ylabel("Fraction of slice reads", fontsize=8, color=_INK2)
+        _guides(a, cfg, kind)
+        a.set_xlim(edges[0], edges[-1] + step)
+        a.set_xlabel("Read length (bp)" if kind == "len"
+                     else f"Mean read Q (reads in {cfg['filter']['minknow_min_len']}-"
+                          f"{cfg['filter']['chopper_max_len']} bp)",
+                     fontsize=8, color=_INK2)
+        a.set_ylabel("Fraction of reads", fontsize=8, color=_INK2)
         a.tick_params(colors=_MUTED, labelsize=7)
         a.grid(axis="y", color="#e1e0d9", lw=0.6)
         a.set_axisbelow(True)
@@ -1022,15 +986,15 @@ def plot_flagged(path: Path, r: SampleResult, prof: SliceProfile | None,
             a.spines[side].set_visible(False)
         for side in ("left", "bottom"):
             a.spines[side].set_color("#c3c2b7")
-    fig.suptitle(f"{r.sample.sample_id} ({r.sample.client}), slice n={r.slice_n:,}"
+    fig.suptitle(f"{r.sample.sample_id} ({r.sample.client}), n={r.n:,}"
                  f"  |  {r.reasons}", fontsize=9, color=_INK, x=0.01, ha="left")
     fig.tight_layout()
     fig.savefig(path, dpi=110, facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
-def write_plots(qc_dir: Path, results: list[SampleResult],
-                profiles: dict[str, SliceProfile], cfg: dict[str, Any],
+def write_plots(qc_dir: Path, ev: Evaluation,
+                profiles: dict[str, DemuxProfile], cfg: dict[str, Any],
                 warnings: list[str]) -> None:
     try:
         import matplotlib
@@ -1040,19 +1004,23 @@ def write_plots(qc_dir: Path, results: list[SampleResult],
                         "plots were not drawn (pip install --user matplotlib)")
         return
 
-    ordered = sorted(results, key=lambda r: (FLAG_ORDER[r.flag], r.sample.order,
-                                             r.sample.barcode))
+    for old in qc_dir.glob("*_heatmap*.png"):
+        old.unlink()
+    ordered = sorted(ev.results, key=lambda r: (FLAG_ORDER[r.flag],
+                                                r.sample.order, r.sample.barcode))
     if len(ordered) <= HEATMAP_MAX_ROWS:
         groups = [("", ordered)]
     else:
         clients = sorted({r.sample.client for r in ordered})
         groups = [(c, [r for r in ordered if r.sample.client == c])
                   for c in clients]
+    when = ("raw demultiplexed, before Chopper" if ev.filter_stage == "post"
+            else "pre mode: after Chopper")
     for client, rows in groups:
         suffix = f"_{client}" if client else ""
         for kind, stem, label in (("len", "length_heatmap", "Read length"),
                                   ("q", "q_heatmap", "Mean read Q")):
-            title = (f"{label} by sample (diagnostic slice, before Chopper)"
+            title = (f"{label} by sample ({when})"
                      + (f" -- {client}" if client else ""))
             plot_heatmap(qc_dir / f"{stem}{suffix}.png", rows, profiles, cfg,
                          kind, title)
@@ -1060,7 +1028,7 @@ def write_plots(qc_dir: Path, results: list[SampleResult],
     flagged_dir = qc_dir / "flagged"
     if flagged_dir.is_dir():
         shutil.rmtree(flagged_dir)
-    flagged = [r for r in results if r.flag in ("CHECK", "FAIL")]
+    flagged = [r for r in ev.results if r.flag in ("CHECK", "FAIL")]
     if flagged:
         flagged_dir.mkdir(parents=True, exist_ok=True)
         for r in flagged:
@@ -1080,109 +1048,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--samplesheet", type=Path, required=True,
                    help="Sample sheet CSV (Client, Sample_ID, Barcode, optional "
                         "Location, Comment, Sample_Type).")
-    p.add_argument("--raw-input-dir", type=Path,
-                   help="fastq_pass directory (not needed with --report-only).")
-    p.add_argument("--primer-file", type=Path,
-                   help="Primer setup file (not needed with --report-only).")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                    help=f"Thresholds (default: {DEFAULT_CONFIG.name} beside "
                         f"this script).")
     p.add_argument("--counts", type=Path, default=None,
                    help="read_counts_summary.txt (default: newest under "
-                        "<output-dir>/run_log_*/).")
-    p.add_argument("--work-dir", type=Path, default=None,
-                   help="Scratch for the slice Minibar run (default: "
-                        "$PBS_JOBFS/qc_work, else $TMPDIR/qc_work).")
-    p.add_argument("--workers", type=int, default=None,
-                   help="Parallel workers (default: $PBS_NCPUS, else 1).")
-    p.add_argument("--chopper", type=Path, default=core.DEFAULT_CHOPPER)
-    p.add_argument("--minibar", type=Path, default=core.DEFAULT_MINIBAR)
-    p.add_argument("--no-crosscheck", action="store_true",
-                   help="Skip the Chopper cross-check (step 4).")
-    p.add_argument("--report-only", action="store_true",
-                   help="Skip steps 1-4; rebuild from qc_report/qc_bins.tsv.gz.")
-    p.add_argument("--keep-work", action="store_true",
-                   help="Do not delete the work dir afterwards.")
+                        "<output-dir>/run_log_*/, else <output-dir>/).")
+    p.add_argument("--demux-qc-dir", type=Path, default=None,
+                   help="demux_qc.py output (default: <output-dir>/demux_qc).")
     args = p.parse_args(argv)
-    if not args.report_only:
-        for name in ("raw_input_dir", "primer_file"):
-            if getattr(args, name) is None:
-                p.error(f"--{name.replace('_', '-')} is required unless "
-                        f"--report-only is given")
+    if args.demux_qc_dir is None:
+        args.demux_qc_dir = args.output_dir / "demux_qc"
     return args
-
-
-def resolve_work_dir(args: argparse.Namespace, qc_dir: Path,
-                     warnings: list[str]) -> Path:
-    if args.work_dir is not None:
-        return args.work_dir
-    for var in ("PBS_JOBFS", "TMPDIR"):
-        if os.environ.get(var):
-            return Path(os.environ[var]) / "qc_work"
-    warnings.append(f"PBS_JOBFS and TMPDIR unset; slice work dir is "
-                    f"{qc_dir / '_work'}")
-    return qc_dir / "_work"
-
-
-def build_slice(args: argparse.Namespace, cfg: dict[str, Any], qc_dir: Path,
-                warnings: list[str]) -> tuple[dict[str, SliceProfile], dict[str, int]]:
-    """Steps 1-4. Returns the merged per-sample profiles and run metadata."""
-    for label, pth, is_dir in (("raw input dir", args.raw_input_dir, True),
-                               ("primer file", args.primer_file, False),
-                               ("minibar.py", args.minibar, False)):
-        if not (pth.is_dir() if is_dir else pth.is_file()):
-            sys.exit(f"ERROR: {label} not found: {pth}")
-    if not args.no_crosscheck and not args.chopper.is_file():
-        sys.exit(f"ERROR: chopper not found: {args.chopper}")
-
-    workers = args.workers or int(os.environ.get("PBS_NCPUS", "1") or "1")
-    sub = cfg["diagnostic_subsample"]
-    f = cfg["filter"]
-
-    banner("QC STEP 1: Selecting diagnostic slice")
-    picked, total = select_slice(args.raw_input_dir, sub["every_nth_file"])
-    slice_files = [p for p in picked if core.fastq_has_reads(p)]
-    empty = len(picked) - len(slice_files)
-    log(f" {len(picked)} of {total} raw files (every {ordinal(sub['every_nth_file'])})"
-        + (f", {empty} empty skipped" if empty else ""))
-    log("========================================")
-    if not slice_files:
-        sys.exit("ERROR: every file in the diagnostic slice is empty")
-
-    work_dir = resolve_work_dir(args, qc_dir, warnings)
-    try:
-        # QC STEP 2: same flags as production, via the production function.
-        chunk_dirs = core.run_minibar(slice_files, work_dir / "minibar",
-                                      args.primer_file, args.minibar,
-                                      qc_dir / "logs" / "minibar",
-                                      max_workers=workers)
-        profiles = profile_slice(chunk_dirs, cfg, workers)
-    finally:
-        if not args.keep_work:
-            shutil.rmtree(work_dir, ignore_errors=True)
-
-    meta = {
-        "every_nth_file": sub["every_nth_file"], "total_files": total,
-        "slice_files": len(slice_files), "empty_files": empty,
-        "min_len": f["min_len"], "max_len": f["max_len"], "min_q": f["min_q"],
-    }
-    if args.no_crosscheck:
-        warnings.append("Chopper cross-check skipped (--no-crosscheck)")
-    else:
-        meta["chopper_in"], meta["chopper_out"] = run_crosscheck(
-            slice_files, args.chopper, cfg, workers)
-    return profiles, meta
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_config(args.config)
     qc_dir = args.output_dir / "qc_report"
-    bins_path = qc_dir / "qc_bins.tsv.gz"
     warnings: list[str] = []
 
     if not args.output_dir.is_dir():
         sys.exit(f"ERROR: output dir not found: {args.output_dir}")
+    banner("QC REPORT: per-sample PASS / CHECK / FAIL")
     log(f" QC config: {cfg['_path']}  version {config_label(cfg)}")
 
     sheet = load_samplesheet(args.samplesheet, cfg["controls"]["types"])
@@ -1192,48 +1080,52 @@ def main(argv: list[str] | None = None) -> int:
         counts_path, w = find_counts_file(args.output_dir)
         warnings += w
     counts = parse_read_counts(counts_path)
-    log(f" Counts:    {counts_path} ({len(counts)} rows)")
-
-    if args.report_only:
-        profiles, meta = read_bins(bins_path)
-        f = cfg["filter"]
-        built = (meta.get("min_len"), meta.get("max_len"), meta.get("min_q"))
-        if built != (f["min_len"], f["max_len"], f["min_q"]):
-            warnings.append(
-                f"qc_bins.tsv.gz was built with filter {built} (min_len, max_len, "
-                f"min_q) but the config now says "
-                f"{(f['min_len'], f['max_len'], f['min_q'])}; the categories "
-                f"still reflect the old filter -- rerun without --report-only")
-    else:
-        qc_dir.mkdir(parents=True, exist_ok=True)
-        profiles, meta = build_slice(args, cfg, qc_dir, warnings)
-        write_bins(bins_path, profiles, meta)
+    log(f" Counts:    {counts_path} ({len(counts.rows)} rows)")
+    profiles = load_demux_qc(args.demux_qc_dir,
+                             [s.sample_id for s in sheet], warnings)
+    log(f" Demux QC:  {args.demux_qc_dir} ({len(profiles)} profiles)")
 
     sheet_ids = {s.sample_id for s in sheet}
-    extra = sorted(set(counts) - sheet_ids - set(CATCH_ALL))
+    extra = sorted(set(counts.rows) - sheet_ids - set(CATCH_ALL))
     if extra:
         warnings.append(f"read_counts_summary.txt rows not in the sample "
                         f"sheet: {', '.join(extra)}")
 
-    banner("QC STEP 6: Flagging and writing outputs")
-    results, runs = evaluate(sheet, counts, profiles, cfg, warnings)
+    # A --diagnostic run uses a wide Chopper window, so pct_retained no
+    # longer means "> 2 kb removed".
+    f = cfg["filter"]
+    want = f"{f['minknow_min_len']}-{f['chopper_max_len']}"
+    windows = {p.length_window for p in profiles.values() if p.length_window}
+    if windows and windows != {want}:
+        warnings.append(
+            f"demux_qc length window {', '.join(sorted(windows))} differs from "
+            f"the config's {want} (--diagnostic run?); long_frac reflects the "
+            f"run's own Chopper window")
 
-    header = tsv_header(cfg, meta, runs)
-    write_sample_tsv(qc_dir / "per_sample_qc.tsv", results, header)
+    ev = evaluate(sheet, counts, profiles, cfg, warnings)
+
+    qc_dir.mkdir(parents=True, exist_ok=True)
+    header = tsv_header(cfg, ev)
+    write_sample_tsv(qc_dir / "per_sample_qc.tsv", ev.results, header)
     client_dir = qc_dir / "per_client"
     if client_dir.is_dir():
         shutil.rmtree(client_dir)
-    for client in sorted({r.sample.client for r in results}):
+    for client in sorted({r.sample.client for r in ev.results}):
         write_sample_tsv(client_dir / f"{client}_qc.tsv",
-                         [r for r in results if r.sample.client == client], header)
-    write_plots(qc_dir, results, profiles, cfg, warnings)
-    write_run_qc(qc_dir / "run_qc.txt", args, cfg, counts_path, results, runs,
-                 profiles, meta, warnings)
+                         [r for r in ev.results if r.sample.client == client],
+                         header)
+    write_bins(qc_dir / "qc_bins.tsv.gz", profiles)
+    write_plots(qc_dir, ev, profiles, cfg, warnings)
+    write_run_qc(qc_dir / "run_qc.txt", args, cfg, counts, ev, profiles,
+                 warnings)
 
-    for ln in run_flag_lines(runs, cfg):
+    log(f" Filter stage: {ev.filter_stage}")
+    for ln in run_flag_lines(ev.runs):
         log(f" {ln}")
     for flag in ("PASS", "CHECK", "FAIL", "CTRL"):
-        log(f" {flag:<6} {sum(r.flag == flag for r in results):>5}")
+        log(f" {flag:<6} {sum(r.flag == flag for r in ev.results):>5}")
+    if warnings:
+        log(f" {len(warnings)} warning(s); see run_qc.txt")
     log(f" Report: {qc_dir}")
     log(f" QC report complete: {datetime.now():%Y-%m-%d %H:%M:%S}")
     log("========================================")

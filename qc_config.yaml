@@ -1,4 +1,4 @@
-# Thresholds and subsample settings for qc_report.py.
+# Thresholds for qc_report.py.
 #
 # Bump config_version whenever a threshold changes: it is written into every
 # output (per_sample_qc.tsv header, run_qc.txt) so a report can always be
@@ -7,30 +7,36 @@
 # Thresholds are starting points -- calibrate on past runs (incl. D6305
 # controls) before relying on them. delivered_reads.fail is a placeholder.
 
-config_version: 1.0
+config_version: 2.0
 
-filter:                       # must mirror production Chopper settings
-  min_len: 1000
-  max_len: 2000
-  min_q: 15                   # Chopper: mean Q >= 15 passes
+filter:                       # informational; must mirror production
+  minknow_min_len: 1000       # MinKNOW drops shorter reads from fastq_pass
+  minknow_min_q: 15           # MinKNOW pass Q
+  chopper_max_len: 2000       # Chopper --maxlength; longer reads are dropped
 
-diagnostic_subsample:
-  every_nth_file: 10          # Minibar on every Nth raw fastq_pass file
-  min_reads_for_stats: 200    # below this, estimated columns are NA
-  crosscheck_tolerance: 0.02  # |Chopper pass frac - slice pass frac|
+# Core amplicon window for core_frac, in bp, half-open [min, max). Set from
+# the observed modal length. Both ends must be multiples of the 50 bp
+# demux_qc bin width and lie inside minknow_min_len..chopper_max_len.
+core_window: {min: 1300, max: 1700}
+
+# Below this many raw demultiplexed reads, every metric except
+# delivered_reads is NA (n<N).
+min_reads_for_stats: 200
 
 # check/fail are absolute thresholds. higher_better: below check -> Check,
 # below fail -> Fail. lower_better: above check -> Check, above fail -> Fail.
+# Fractions are 0-1.
+#
+# absolute_only: never switched to relative (MAD) mode, even when the run
+# median is bad. delivered_reads: 15,000 is a deliverable floor, not a
+# run-relative judgement. modal_dev_bp: already relative to the run median.
 metrics:
-  # absolute_only: never switched to relative (MAD) mode, even when the run
-  # median is bad. 15,000 reads is a deliverable floor, not a run-relative
-  # judgement, so a run where every sample is short still flags every sample.
   delivered_reads: {direction: higher_better, check: 15000, fail: 5000, absolute_only: true}
   primer_found:    {direction: higher_better, check: 0.90, fail: 0.75}
-  retention:       {direction: higher_better, check: 0.70, fail: 0.50}
-  short_frac:      {direction: lower_better,  check: 0.20, fail: 0.40}
   long_frac:       {direction: lower_better,  check: 0.05, fail: 0.15}
-  lowq_frac:       {direction: lower_better,  check: 0.25, fail: 0.50}
+  core_frac:       {direction: higher_better, check: 0.75, fail: 0.50}
+  modal_dev_bp:    {direction: lower_better,  check: 50,   fail: 100, absolute_only: true}
+  pct_q20:         {direction: higher_better, check: 0.60, fail: 0.40}
 
 run_level:
   outlier_k_check: 3          # robust z >= 3 in the bad direction -> Check

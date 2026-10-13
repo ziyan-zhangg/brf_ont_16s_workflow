@@ -1,20 +1,11 @@
 """Stand-in for tools/chopper/chopper-linux-musl, for tests only.
 
 Reads fastq on stdin, writes fastq on stdout, dropping records outside the
---minlength/--maxlength window or with mean read Q below -q. Mean Q is the
-mean per-base error probability converted back to Phred, as the real chopper
-computes it, so qc_report.py's Chopper cross-check can be exercised.
+--minlength/--maxlength window. Enough to exercise run_chopper()'s plumbing;
+the real chopper also filters on mean quality.
 """
 import argparse
-import math
 import sys
-
-
-def mean_q(qual: bytes) -> float:
-    if not qual:
-        return 0.0
-    err = sum(10.0 ** (-(b - 33) / 10.0) for b in qual) / len(qual)
-    return -10.0 * math.log10(err) if err > 0 else 93.0
 
 
 def main() -> int:
@@ -32,8 +23,7 @@ def main() -> int:
             break
         seq, plus, qual = inp.readline(), inp.readline(), inp.readline()
         total += 1
-        if (args.minlength <= len(seq.strip()) <= args.maxlength
-                and mean_q(qual.strip()) >= args.q):
+        if args.minlength <= len(seq.strip()) <= args.maxlength:
             out.write(hdr + seq + plus + qual)
             kept += 1
     out.flush()

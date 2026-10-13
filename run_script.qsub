@@ -22,12 +22,16 @@
 #               Step 5 - Cutadapt two-pass orient + trim
 #               Step 6 - Organise reads by client + write summaries
 #               Step 7 - Collect logs into run_log_<date>/
+#   Post-step: qc_report.py -> qc_report/  (per-sample PASS / CHECK / FAIL)
 #
 # Both modes share this numbering, so step N means the same thing in either
 # job log. pre skips step 4; post skips step 1.
 #
-# Set filter_stage below to choose when Chopper runs. Both orderings are
-# runnable on the same input; pre is the unchanged legacy behaviour.
+# Set filter_stage below to choose when Chopper runs. post is the production
+# default: MinKNOW already drops reads < 1 kb and < Q15 from fastq_pass, so
+# post mode only adds the > 2 kb reads to Minibar's load, and it is the only
+# mode in which the QC report can see them. pre and post were validated
+# byte-identical on per-sample counts. pre is kept as the legacy ordering.
 #
 # For a first look at an unfamiliar run, add --diagnostic to the core call:
 # it forces post mode with a 100-5000 bp window so the demux QC observes the
@@ -107,9 +111,13 @@ samplesheet=/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv
 output_dir=/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_${date_stamp}
 
 # when Chopper runs relative to demultiplexing:
-#   pre  - filter raw fastq.gz first, then demultiplex   (legacy, default)
-#   post - demultiplex raw fastq_pass, then filter per sample
-filter_stage=pre
+#   post - demultiplex raw fastq_pass, then filter per sample   (default)
+#   pre  - filter raw fastq.gz first, then demultiplex          (legacy)
+filter_stage=post
+
+# 1 = write the per-sample QC report (qc_report/) after the pipeline.
+# Non-fatal: a QC failure is reported but does not fail the job.
+run_qc_report=1
 
 #--------DONT-CHANGE----------------------------------------------------------
 _root=/g/data/vz35/PromethION_data/sequencer_uploads
@@ -127,6 +135,8 @@ raw_input_dir="${_fq_dirs[0]}"
 tools_dir=/g/data/vz35/ONT_16s_workflow/tools/brf_ont_16s_workflow/
 generate_primer_script=${tools_dir}/generate_primer_setup.py # attention to location
 core_script=${tools_dir}/filter_chopper_demux_minibar.py # attention to location
+qc_script=${tools_dir}/qc_report.py
+qc_config=${tools_dir}/qc_config.yaml
 
 primer_output_dir=/g/data/vz35/ONT_16s_workflow/sample_sheet
 primer_file="${primer_output_dir}/16S_primer_setup_${date_stamp}.txt"
@@ -189,3 +199,21 @@ python3 "$core_script" \
     ${core_extra_args[@]+"${core_extra_args[@]}"}
     # ^ expands to nothing when the array is empty, without tripping `set -u`
     #   on older bash where "${arr[@]}" counts as an unbound reference.
+
+#=============================================================================
+# POST-STEP: per-sample QC report (reads demux_qc/ + read_counts_summary.txt)
+#=============================================================================
+# Takes seconds. Deliverables are already in place by now, so a QC failure
+# (e.g. PyYAML missing) is reported but does not fail the job; re-run it by
+# hand or with run_qc_report.qsub.
+if [[ "$run_qc_report" == "1" ]]; then
+    if python3 "$qc_script" \
+        --output-dir  "$output_dir" \
+        --samplesheet "$samplesheet" \
+        --config      "$qc_config"; then
+        echo " QC report: ${output_dir}/qc_report/run_qc.txt"
+    else
+        echo "WARNING: qc_report.py failed; pipeline outputs are unaffected." >&2
+        echo "         Re-run with: qsub -v output_dir=${output_dir} run_qc_report.qsub" >&2
+    fi
+fi

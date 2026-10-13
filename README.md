@@ -18,6 +18,7 @@ The workflow runs in a single PBS job (`run_script.qsub`) that calls a pre-step 
 | Step 5 | -> **Cutadapt** (two-pass) | Normalises read orientation and trims 5'/3' primers |
 | Step 6 | -> organise + summarise | Groups reads by client, writes per-client and run-level read-count summaries |
 | Step 7 | -> log collection | Moves all `*.log` / `*.txt` files into `run_log_<date>/` |
+| Post-step | `qc_report.py` | Per-sample PASS / CHECK / FAIL report into `qc_report/` (see [Per-sample QC report](#per-sample-qc-report)) |
 
 After running the pipeline on the control sample and confirming that demultiplexing counts and per-sample yields match expectations, the same `run_script.qsub` can be submitted unchanged for production samples.
 
@@ -27,8 +28,8 @@ After running the pipeline on the control sample and confirming that demultiplex
 
 | Mode | Chopper runs | Minibar sees | Notes |
 |------|--------------|--------------|-------|
-| `pre` *(default)* | Step 1, on whole `fastq.gz` files | Filtered reads | Unchanged legacy behaviour |
-| `post` | Step 4, on merged per-sample FASTQs | Raw `fastq_pass` reads | No pre-filter at all — `fastq_pass` is already MinKNOW min-qscore filtered |
+| `post` *(default)* | Step 4, on merged per-sample FASTQs | Raw `fastq_pass` reads | No pre-filter at all — `fastq_pass` is already MinKNOW filtered |
+| `pre` | Step 1, on whole `fastq.gz` files | Filtered reads | Legacy ordering |
 
 Both modes share one step numbering, so step *N* means the same thing in either job log and the two can be read side by side. Each mode skips exactly one step, and the skip is announced in the log rather than silently absent:
 
@@ -45,7 +46,11 @@ STEP 7: Collecting logs               STEP 7: Collecting logs
 
 `pre` is byte-for-byte identical to the pipeline as it stood before the two-stage option was added, so the two orderings can be run on the same input and compared directly.
 
-**Why `post` matters.** Filtering before demultiplexing throws reads away before anyone can see what they looked like, so a low per-sample yield is ambiguous: too few reads, or the right reads outside the assumed 1–2 kb window? Running Minibar first makes the demux loss and the filter loss separately visible (steps 3 and 4), at the cost of Minibar processing 2–4× more reads.
+**Why `post` is the default.** Filtering before demultiplexing throws reads away before anyone can see what they looked like, so a low per-sample yield is ambiguous: too few reads, or the right reads outside the assumed 1–2 kb window? Running Minibar first makes the demux loss and the filter loss separately visible (steps 3 and 4).
+
+The extra cost is small. MinKNOW already applies a 1 kb minimum read length and pass Q15, so `fastq_pass` holds only reads ≥ 1,000 bp at Q ≥ 15, and Chopper (`-q 15 --minlength 1000 --maxlength 2000`) in practice only removes reads > 2,000 bp. Post mode therefore adds only those > 2 kb reads to Minibar's load, and in exchange the QC report can measure them per sample (`long_frac`). The two modes were validated byte-identical on per-sample counts, so switching changes what we can see, not what clients receive.
+
+The core script's own `--filter-stage` default is still `pre`; `run_script.qsub` sets `post` explicitly.
 
 ---
 
@@ -57,9 +62,9 @@ generate_primer_setup.py         # Pre-step: sample sheet -> primer setup file
 filter_chopper_demux_minibar.py  # Core pipeline: Steps 1-7
 demux_qc.py                      # Step 3: per-sample demux QC (imported by core script)
 cutadapt_2pass.py                # Step 5: two-pass cutadapt (imported by core script)
-qc_report.py                     # Per-sample QC report (separate job, after the pipeline)
+qc_report.py                     # Post-step: per-sample QC report (reads demux_qc/ + counts)
 qc_config.yaml                   # QC report thresholds, versioned
-run_qc_report.qsub               # PBS wrapper for qc_report.py
+run_qc_report.qsub               # PBS wrapper to re-run qc_report.py on a finished run
 ```
 
 `demux_qc.py` and `cutadapt_2pass.py` are imported as siblings of the core script, so all four `.py` files must sit in the same directory on Gadi.
@@ -121,10 +126,11 @@ Edit the **Variables** section near the top of `run_script.qsub`:
 run_name=ONT_16S_20260422          # Subdirectory under sequencer_uploads/
 samplesheet=/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv
 output_dir=/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_<date>
-filter_stage=pre                   # pre | post -- see "Filter stage" above
+filter_stage=post                  # post | pre -- see "Filter stage" above
+run_qc_report=1                    # 1 = write qc_report/ at the end of the job
 ```
 
-Everything in the `DONT-CHANGE` section below resolves automatically from these four variables.
+Everything in the `DONT-CHANGE` section below resolves automatically from these variables.
 
 In `post` mode the wrapper additionally points Minibar's per-file working directories at `$PBS_JOBFS` (node-local disk) and passes `--minibar-work-dir` to the core script. Only the merged per-sample FASTQs are written to `output_dir`. Nothing outside `/g/data/vz35` and `$PBS_JOBFS` is touched, so `-l storage=gdata/vz35` remains correct in both modes.
 
@@ -241,6 +247,7 @@ Per-file Minibar subdirectories are removed after merging to save storage. In `p
 | Raw demuxed read count | Reads Minibar assigned to that barcode |
 | Length histogram | 50 bp bins, plus exact N50, median, and modal length |
 | Mean read Q | Per-read mean error probability converted to Phred, then averaged over reads |
+| Q histogram | Integer bins of that per-read mean Q, for all reads and for reads inside `[minlength, maxlength]`; `pct_q20` = % of in-window reads at Q ≥ 20 |
 | % within window | Share of reads inside `[minlength, maxlength]` |
 
 `sample_unk` and `sample_Multiple_Matches` are profiled too — an inflated unassigned bin is the first sign of a demux problem, and its length profile says whether the cause is chemistry or barcode matching.
@@ -250,7 +257,10 @@ Outputs, written to `demux_qc/`:
 | File | Contents |
 |------|----------|
 | `<SampleID>.tsv` | One row per 50 bp bin; scalar stats in a `#`-prefixed header block (read with `pandas.read_csv(..., sep='\t', comment='#')`) |
-| `demux_qc_summary.tsv` | One row per sample, all scalar stats, real samples first |
+| `<SampleID>.q.tsv` | One row per integer mean-Q bin: `q_bin`, `count_all`, `count_in_window`; same `#` header convention |
+| `demux_qc_summary.tsv` | One row per sample, all scalar stats (incl. `pct_q20`), real samples first |
+
+No read is altered.
 
 The step runs in **both** filter stages, but means different things in each: in `post` mode it profiles genuinely raw demultiplexed reads; in `pre` mode those reads have already been through Chopper. Every QC output records which stage produced it, so the two are never confused. Skip with `--no-demux-qc`.
 
@@ -341,9 +351,11 @@ minibar_output/ONT_16S_TBC_<date>/
 │   └── sample_unk.fastq
 ├── demux_qc/
 │   ├── <SampleID>.tsv
+│   ├── <SampleID>.q.tsv
 │   ├── unk.tsv
 │   ├── Multiple_Matches.tsv
 │   └── demux_qc_summary.tsv
+├── qc_report/                       # see "Per-sample QC report"
 └── run_log_<date>/
     ├── cutadapt_summary.txt
     ├── read_counts_summary.txt
@@ -363,66 +375,65 @@ minibar_output/ONT_16S_TBC_<date>/
 
 ## Per-sample QC report
 
-`qc_report.py` produces one table per run with one row per sample, a PASS / CHECK / FAIL flag and reason codes, plus run-level verdicts and length/Q heatmaps. It judges only what the facility is responsible for -- did the sample amplify and sequence into usable reads. Chimera %, classification and NTC read ratios are the client's responsibility and are not reported.
+`qc_report.py` produces one table per run with one row per sample, a PASS / CHECK / FAIL flag and reason codes, plus run-level verdicts and length/Q heatmaps. It judges only what the facility is responsible for -- did the sample amplify and sequence into usable reads. Chimera %, classified / unclassified reads and NTC read ratios are the client's responsibility and are not reported.
 
-It runs as a **separate PBS job** after the pipeline; the pipeline itself is unchanged and stays in `filter_stage=pre`.
+It is a pure reader of `demux_qc/` and `read_counts_summary.txt`: no FASTQ access, no Minibar, no Chopper. It takes seconds and runs automatically at the end of `run_script.qsub` (`run_qc_report=1`). A QC failure there is reported but does not fail the job. To re-run it -- after changing thresholds, on a past run, or if the in-job report failed:
 
 ```bash
-jid=$(qsub run_script.qsub)
-qsub -W depend=afterok:$jid -v output_dir=<run output dir> run_qc_report.qsub
+qsub -v output_dir=<run output dir> run_qc_report.qsub
+# or by hand
+python3 qc_report.py --output-dir <run output dir> --samplesheet <sheet.csv>
 ```
 
 Pass `output_dir` explicitly: `run_script.qsub` stamps it with the date its job *starts*, which is not necessarily the day you submit.
 
-### How it works
+### Metrics (all exact)
 
-Production filters before demultiplexing, so the unfiltered per-sample reads are never seen. The report takes a **diagnostic slice** instead: Minibar (production flags) on every Nth raw `fastq_pass` file (default 10th, natural name order so the slice spreads across the run), then one pass over each sample's slice reads for a 50 bp length histogram, an integer mean-Q histogram and four exclusive categories (short / long / lowQ / pass, tested in that order against the `filter` section of the config). Chopper is re-run on the slice raw files as a cross-check; `run_qc.txt` warns if its pass fraction differs from the slice's by more than `crosscheck_tolerance`.
+| Metric | Source | Better | Catches |
+|---|---|---|---|
+| `delivered_reads` | `Reads` in `read_counts_summary.txt` | higher | Depth vs the 15,000 floor |
+| `primer_found` | `pct_pass1_kept` | higher | Correct barcode, wrong amplicon |
+| `long_frac` | 1 − `pct_retained` (post mode only) | lower | Chimeras, concatemers, ligation artefacts (> 2 kb) |
+| `core_frac` | `demux_qc` length histogram: reads in `core_window` (default 1,300–1,700 bp) / reads in 1,000–2,000 bp | higher | Truncated / partial amplicons at 1,000–1,300 bp |
+| `modal_dev_bp` | \|modal length − run median modal length\| | lower | Wrong product / assay mix-up |
+| `pct_q20` | `demux_qc` Q histogram: in-window reads at mean Q ≥ 20 | higher | Quality hugging the Q15 floor |
 
-| Metric | Source | Type |
-|---|---|---|
-| `delivered_reads` | `Reads` in `read_counts_summary.txt` | exact |
-| `primer_found` | `pct_pass1_kept` in `read_counts_summary.txt` | exact |
-| `retention` | slice pass / slice demuxed | estimated |
-| `short_frac`, `long_frac`, `lowq_frac` | slice categories | estimated |
+`core_frac` and `pct_q20` are computed on reads within 1,000–2,000 bp, so they describe the delivered population. `raw_demuxed` in the table is Minibar's count before Chopper.
 
-Flagging, per metric, 0 = pass, 1 = check, 2 = fail; the sample's flag is the worst metric:
+**Known limit.** Anything < 1 kb is discarded by MinKNOW and never reaches the pipeline, so short-product failures (e.g. BP_001 / BP_007 type) can only show up as low `delivered_reads` or a low `core_frac`. Short and low-Q fractions cannot be measured per sample.
+
+**Pre-mode runs.** Chopper ran before Minibar, so no > 2 kb reads were demultiplexed: `long_frac` is `NA (pre mode)` for every sample and `run_qc.txt` says so at the top. The other metrics still work. Runs whose `demux_qc/` predates the Q histogram get `pct_q20 = NA`, with a warning.
+
+### Flagging
+
+Per metric 0 = pass, 1 = check, 2 = fail; the sample's flag is the worst metric.
 
 - Absolute thresholds from `qc_config.yaml` by default.
-- If a metric's **run median** is already at CHECK or worse, a run flag is raised (e.g. `RUN: LOW_Q (median 40%, CHECK)`) and samples are judged on that metric **relative to the run**: robust z = (value - median) / max(1.4826 x MAD, `mad_floor`), CHECK at z >= 3, FAIL at z >= 5, in the bad direction only. One bad flowcell therefore raises one run flag instead of turning the whole table red. `delivered_reads` is `absolute_only` -- 15,000 reads is a deliverable floor, not a relative judgement. Fewer than `min_samples` real samples keeps absolute thresholds.
-- Samples with fewer than `min_reads_for_stats` slice reads get `NA (n<200)` in the estimated columns and are flagged on exact metrics only.
-- Controls (`Sample_Type` NTC / BLANK / POS_CTRL) are reported with flag `CTRL`.
+- If a metric's **run median** is already at CHECK or worse, a run flag is raised (e.g. `RUN: LOW_Q20 (median 35%, FAIL)`) and samples are judged on that metric **relative to the run**: robust z = (value − median) / max(1.4826 × MAD, `mad_floor`), CHECK at z ≥ 3, FAIL at z ≥ 5, in the bad direction only. One bad flowcell therefore raises one run flag instead of turning the whole table red. Fewer than `min_samples` real samples keeps absolute thresholds.
+- `delivered_reads` and `modal_dev_bp` are `absolute_only`: 15,000 reads is a deliverable floor, and `modal_dev_bp` is already relative to the run.
+- Samples with fewer than `min_reads_for_stats` (200) raw demultiplexed reads get `NA (n<200)` in every metric except `delivered_reads`, which is still flagged.
+- Controls (`Sample_Type` NTC / BLANK / POS_CTRL) are reported with flag `CTRL` and left out of every run median.
 
-Reason codes list every non-pass metric, worst first, e.g. `FAIL: SHORT(52%);RETENTION(41%)`; relative-mode entries carry their z (`LOWQ(80%,z=6.2)`).
+Reason codes list every non-pass metric, worst first, e.g. `FAIL: LOW_CORE(48%);LONG(22%)`; relative-mode entries carry their z (`LOW_Q20(5%,z=13.3)`). Codes: `READS`, `PRIMER`, `LONG`, `LOW_CORE`, `MODAL`, `LOW_Q20`.
 
-**PASS / CHECK / FAIL is triage, not sign-off.** Review `run_qc.txt` and the heatmaps before release. Thresholds in `qc_config.yaml` are starting points and must be calibrated on past runs (including D6305 controls); bump `config_version` whenever they change -- it is recorded in every output.
+**PASS / CHECK / FAIL is triage, not sign-off.** Review `run_qc.txt` and the heatmaps before release. Thresholds in `qc_config.yaml` are starting points and must be calibrated on past runs (including D6305 controls); bump `config_version` whenever they change -- it is recorded in every output. Set `core_window` from the observed modal length.
 
 ### Outputs -- `<output_dir>/qc_report/`
 
 | File | Contents |
 |---|---|
-| `per_sample_qc.tsv` | One row per sample: metrics, flag, reasons, Comment. `#` header records config version, slice size and which columns are estimated |
+| `per_sample_qc.tsv` | One row per sample: client, sample, barcode, type, `raw_demuxed`, every metric, `modal_length`, flag, reasons, Comment. `#` header records config version, filter stage and windows |
 | `per_client/<Client>_qc.tsv` | Per-client cut of the same table |
-| `run_qc.txt` | Config version, slice size, Chopper cross-check, run-level flags and medians, flag counts, `unk` / `Multiple_Matches` profile, warnings |
-| `qc_bins.tsv.gz` | Long format (sample, kind, bin, count) -- everything needed to re-threshold or re-plot |
-| `length_heatmap.png`, `q_heatmap.png` | Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised; Chopper window shaded / Q floor dashed; flag strip on the left, flagged rows labelled. Split per client above 384 rows |
+| `run_qc.txt` | Config version, filter stage, windows, run-level flags and medians, flag counts, `unk` / `Multiple_Matches` share, warnings |
+| `qc_bins.tsv.gz` | Long format (sample, kind, bin, count); kind `len` (50 bp, all reads), `q` (in-window reads), `q_all` -- for re-plotting / re-thresholding |
+| `length_heatmap.png`, `q_heatmap.png` | Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised. Length axis 1–4 kb shows the > 2 kb tail, core window shaded, line at 2,000 bp; Q axis has lines at Q20 and Q15. Flag strip on the left, flagged rows labelled. Split per client above 384 rows |
 | `flagged/<Sample>.png` | Length and Q histograms for CHECK / FAIL samples |
-| `logs/minibar/` | Per-chunk Minibar logs for the slice |
-
-### Changing thresholds
-
-Edit `qc_config.yaml`, then rebuild from the saved bins without touching reads:
-
-```bash
-qsub -v output_dir=<run output dir>,report_only=1 run_qc_report.qsub
-```
-
-Changing the `filter` section needs a full re-run: the categories depend on it, and `--report-only` warns if the bins were built with a different filter.
 
 ### Requirements and tests
 
 Needs PyYAML, and matplotlib for the plots (the tables are written without it). Once per user on Gadi: `module load python3/3.12.1 && pip install --user pyyaml matplotlib`. The wrapper checks for both before starting.
 
-`python tests/test_qc_report.py` builds a fake run and checks the categories, flags, the `read_counts_summary.txt` parser, relative mode and `--report-only`, using `tests/fake_minibar.py` and `tests/fake_chopper.py`.
+`python tests/test_qc_report.py` builds fake runs in post and pre mode (real `demux_qc` + production `read_counts_summary.txt` writer) and checks the Q bins against a direct calculation, every metric and flag, the counts parser incl. pre-mode NA handling, relative mode and controls.
 
 ---
 
@@ -478,7 +489,7 @@ python3 filter_chopper_demux_minibar.py \
 
 | Option | Effect |
 |--------|--------|
-| `--filter-stage {pre,post}` | When Chopper runs. Default `pre`. |
+| `--filter-stage {pre,post}` | When Chopper runs. Default `pre` here; `run_script.qsub` passes `post`. |
 | `--diagnostic` | Shorthand for `--filter-stage post --minlength 100 --maxlength 5000`. Explicitly given flags still win. |
 | `--min-quality`, `--minlength`, `--maxlength` | Chopper filter parameters (`--min-length` / `--max-length` accepted as aliases). |
 | `--minibar-work-dir` | Where Minibar's per-file working directories are created. Default: the output dir. |

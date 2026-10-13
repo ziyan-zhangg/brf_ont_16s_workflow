@@ -4,55 +4,37 @@
 #PBS -l wd
 #PBS -m e
 #PBS -M ziyan.zhang@anu.edu.au
-#PBS -l ncpus=8
-#PBS -l mem=32GB
-#PBS -l jobfs=50GB
-#PBS -l walltime=03:00:00
+#PBS -l ncpus=1
+#PBS -l mem=4GB
+#PBS -l walltime=00:15:00
 #PBS -l storage=gdata/vz35
 #PBS -q normal
 
 #--------README---------------------------------------------------------------
 # Per-sample QC report (PASS / CHECK / FAIL) for a finished pipeline run.
 # Wraps qc_report.py; writes everything to <output_dir>/qc_report/.
-# The production pipeline and its outputs are never touched.
 #
-#   QC STEP 1  every Nth raw fastq_pass file          (qc_config.yaml)
-#   QC STEP 2  Minibar on the slice, production flags, work dirs on jobfs
-#   QC STEP 3  per-sample length / mean-Q / category profile of the slice
-#   QC STEP 4  Chopper cross-check on the slice raw files
-#   QC STEP 6  read_counts_summary.txt + flags + tables + heatmaps
+# run_script.qsub already runs qc_report.py at the end of every job, so this
+# wrapper is only for re-running it: after changing qc_config.yaml, on a past
+# run, or if the in-job report failed. It reads small tables only
+# (demux_qc/ + read_counts_summary.txt) -- no FASTQ, Minibar or Chopper --
+# and takes seconds:
 #
-# Chain after the pipeline so it only runs if the pipeline succeeded:
+#   qsub -v output_dir=<run output dir> run_qc_report.qsub
+#
+# Or chain it after a pipeline job run with run_qc_report=0:
 #
 #   jid=$(qsub run_script.qsub)
 #   qsub -W depend=afterok:$jid -v output_dir=<run output dir> run_qc_report.qsub
 #
-# output_dir: run_script.qsub builds it from the date its job *starts*, so a
-# pipeline job that queues past midnight writes to the next day's dir. Pass
-# the real dir with -v output_dir=... (or edit below) rather than relying on
-# today's date here; the job stops with an error if the dir does not exist.
-#
-# Thresholds only changed? Re-run without touching reads:
-#
-#   qsub -v output_dir=<dir>,report_only=1 run_qc_report.qsub
+# output_dir: run_script.qsub builds it from the date its job *starts*, so
+# pass the real dir with -v output_dir=... rather than relying on today's
+# date here; the job stops with an error if the dir does not exist.
 #
 # Python packages: needs PyYAML, and matplotlib for the plots (the tables are
 # still written without it). If the preflight below fails, once per user:
 #
 #   module load python3/3.12.1 && pip install --user pyyaml matplotlib
-#
-#--------Resource notes-------------------------------------------------------
-# Starting values -- confirm on the first run from the PBS resource footer.
-#
-# ncpus=8      Minibar on ~10% of the files, one chunk per worker, then the
-#              profiling pass in worker processes. Same thread-pool pattern
-#              as Step 2 of the pipeline, so the same limits apply: no
-#              faster than the slowest chunk.
-# mem=32GB     4GB per core, as for the pipeline.
-# jobfs=50GB   Minibar's per-chunk output for the slice (unfiltered reads,
-#              ~10% of the run). Deleted at the end of the job.
-# walltime=3h  Dominated by Minibar on the slice.
-# queue        normal; biodev also works, as for the pipeline.
 #-----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -64,23 +46,13 @@ date_stamp=$(date +%Y%m%d)
 
 #--------Variables (edit per run, or override with qsub -v)-------------------
 # Same values as the run_script.qsub that produced the run.
-run_name=${run_name:-ONT_16S_20260422}
 samplesheet=${samplesheet:-/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv}
 output_dir=${output_dir:-/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_${date_stamp}}
-
-# 1 = rebuild from qc_report/qc_bins.tsv.gz only (no Minibar, no Chopper)
-report_only=${report_only:-0}
-
-# Optional: an existing primer setup file. Empty = regenerate one on jobfs
-# from $samplesheet with generate_primer_setup.py -- identical content to the
-# pipeline's, without depending on which day that job ran.
-primer_file=${primer_file:-}
 
 #--------DONT-CHANGE----------------------------------------------------------
 tools_dir=/g/data/vz35/ONT_16s_workflow/tools/brf_ont_16s_workflow/
 qc_script=${tools_dir}/qc_report.py
-qc_config=${tools_dir}/qc_config.yaml
-generate_primer_script=${tools_dir}/generate_primer_setup.py
+qc_config=${qc_config:-${tools_dir}/qc_config.yaml}
 
 if [[ ! -d "$output_dir" ]]; then
     echo "ERROR: output_dir not found: ${output_dir}" >&2
@@ -97,54 +69,14 @@ if ! python3 -c "import matplotlib" 2>/dev/null; then
     echo "WARNING: matplotlib not available; tables only, no heatmaps." >&2
 fi
 
-qc_args=(
-    --output-dir  "$output_dir"
-    --samplesheet "$samplesheet"
-    --config      "$qc_config"
-)
-
-if [[ "$report_only" == "1" ]]; then
-    qc_args+=(--report-only)
-else
-    _root=/g/data/vz35/PromethION_data/sequencer_uploads
-    mapfile -t _fq_dirs < <(find "${_root}/${run_name}" -type d -name "fastq_pass")
-    if [[ ${#_fq_dirs[@]} -eq 0 ]]; then
-        echo "ERROR: fastq_pass not found under ${_root}/${run_name}" >&2
-        exit 1
-    elif [[ ${#_fq_dirs[@]} -gt 1 ]]; then
-        echo "ERROR: multiple fastq_pass directories found under ${_root}/${run_name}:" >&2
-        printf '  %s\n' "${_fq_dirs[@]}" >&2
-        exit 1
-    fi
-    raw_input_dir="${_fq_dirs[0]}"
-
-    if [[ -n "${PBS_JOBFS:-}" ]]; then
-        scratch="${PBS_JOBFS}"
-    elif [[ -n "${TMPDIR:-}" ]]; then
-        scratch="${TMPDIR}"
-    else
-        echo "ERROR: neither PBS_JOBFS nor TMPDIR is set; refusing to use /tmp" >&2
-        exit 1
-    fi
-
-    if [[ -z "$primer_file" ]]; then
-        python3 "$generate_primer_script" "$samplesheet" \
-            -o "${scratch}/qc_primer" --date qc
-        primer_file="${scratch}/qc_primer/16S_primer_setup_qc.txt"
-    fi
-
-    qc_args+=(
-        --raw-input-dir "$raw_input_dir"
-        --primer-file   "$primer_file"
-        --work-dir      "${scratch}/qc_work"
-    )
-fi
-
 echo "========================================"
 echo " QC report: $(date)"
 echo " Output dir:  ${output_dir}"
 echo " Samplesheet: ${samplesheet}"
-echo " Report only: ${report_only}"
+echo " Config:      ${qc_config}"
 echo "========================================"
 
-python3 "$qc_script" "${qc_args[@]}"
+python3 "$qc_script" \
+    --output-dir  "$output_dir" \
+    --samplesheet "$samplesheet" \
+    --config      "$qc_config"
