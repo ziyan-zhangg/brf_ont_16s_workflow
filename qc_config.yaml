@@ -1,0 +1,42 @@
+# Thresholds and subsample settings for qc_report.py.
+#
+# Bump config_version whenever a threshold changes: it is written into every
+# output (per_sample_qc.tsv header, run_qc.txt) so a report can always be
+# traced back to the thresholds that produced it.
+#
+# Thresholds are starting points -- calibrate on past runs (incl. D6305
+# controls) before relying on them. delivered_reads.fail is a placeholder.
+
+config_version: 1.0
+
+filter:                       # must mirror production Chopper settings
+  min_len: 1000
+  max_len: 2000
+  min_q: 15                   # Chopper: mean Q >= 15 passes
+
+diagnostic_subsample:
+  every_nth_file: 10          # Minibar on every Nth raw fastq_pass file
+  min_reads_for_stats: 200    # below this, estimated columns are NA
+  crosscheck_tolerance: 0.02  # |Chopper pass frac - slice pass frac|
+
+# check/fail are absolute thresholds. higher_better: below check -> Check,
+# below fail -> Fail. lower_better: above check -> Check, above fail -> Fail.
+metrics:
+  # absolute_only: never switched to relative (MAD) mode, even when the run
+  # median is bad. 15,000 reads is a deliverable floor, not a run-relative
+  # judgement, so a run where every sample is short still flags every sample.
+  delivered_reads: {direction: higher_better, check: 15000, fail: 5000, absolute_only: true}
+  primer_found:    {direction: higher_better, check: 0.90, fail: 0.75}
+  retention:       {direction: higher_better, check: 0.70, fail: 0.50}
+  short_frac:      {direction: lower_better,  check: 0.20, fail: 0.40}
+  long_frac:       {direction: lower_better,  check: 0.05, fail: 0.15}
+  lowq_frac:       {direction: lower_better,  check: 0.25, fail: 0.50}
+
+run_level:
+  outlier_k_check: 3          # robust z >= 3 in the bad direction -> Check
+  outlier_k_fail: 5           # robust z >= 5 in the bad direction -> Fail
+  mad_floor: 0.02             # floor on the scaled MAD, in fraction units
+  min_samples: 8              # fewer real samples than this: stay absolute
+
+controls:
+  types: [NTC, BLANK, POS_CTRL]

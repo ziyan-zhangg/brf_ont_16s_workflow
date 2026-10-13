@@ -57,6 +57,9 @@ generate_primer_setup.py         # Pre-step: sample sheet -> primer setup file
 filter_chopper_demux_minibar.py  # Core pipeline: Steps 1-7
 demux_qc.py                      # Step 3: per-sample demux QC (imported by core script)
 cutadapt_2pass.py                # Step 5: two-pass cutadapt (imported by core script)
+qc_report.py                     # Per-sample QC report (separate job, after the pipeline)
+qc_config.yaml                   # QC report thresholds, versioned
+run_qc_report.qsub               # PBS wrapper for qc_report.py
 ```
 
 `demux_qc.py` and `cutadapt_2pass.py` are imported as siblings of the core script, so all four `.py` files must sit in the same directory on Gadi.
@@ -93,6 +96,8 @@ Required columns:
 | `Sample_ID` | Sample identifier (alphanumeric, `-`, `_`; other characters are sanitised) |
 | `Barcode` | Twist 384 barcode ID matching a row in the barcode reference |
 | `Comment` | *(optional)* Shown in the per-client summary for samples below the low-read threshold |
+| `Location` | *(optional)* Plate position; carried into the QC report |
+| `Sample_Type` | *(optional, QC report only)* `SAMPLE` (default when blank), `NTC`, `BLANK` or `POS_CTRL`. Controls get flag `CTRL` and are left out of run medians |
 
 ### 2. Raw reads
 
@@ -353,6 +358,71 @@ minibar_output/ONT_16S_TBC_<date>/
 - `summary.txt` -- per-client read counts; low-count samples (< 15,000 reads) show the `Comment` column from the sample sheet
 - `demux_qc/` -- per-sample length histograms and quality stats taken before filtering
 - `read_counts_summary.txt` -- overall run summary; ends up in `run_log_<date>/` after step 7
+
+---
+
+## Per-sample QC report
+
+`qc_report.py` produces one table per run with one row per sample, a PASS / CHECK / FAIL flag and reason codes, plus run-level verdicts and length/Q heatmaps. It judges only what the facility is responsible for -- did the sample amplify and sequence into usable reads. Chimera %, classification and NTC read ratios are the client's responsibility and are not reported.
+
+It runs as a **separate PBS job** after the pipeline; the pipeline itself is unchanged and stays in `filter_stage=pre`.
+
+```bash
+jid=$(qsub run_script.qsub)
+qsub -W depend=afterok:$jid -v output_dir=<run output dir> run_qc_report.qsub
+```
+
+Pass `output_dir` explicitly: `run_script.qsub` stamps it with the date its job *starts*, which is not necessarily the day you submit.
+
+### How it works
+
+Production filters before demultiplexing, so the unfiltered per-sample reads are never seen. The report takes a **diagnostic slice** instead: Minibar (production flags) on every Nth raw `fastq_pass` file (default 10th, natural name order so the slice spreads across the run), then one pass over each sample's slice reads for a 50 bp length histogram, an integer mean-Q histogram and four exclusive categories (short / long / lowQ / pass, tested in that order against the `filter` section of the config). Chopper is re-run on the slice raw files as a cross-check; `run_qc.txt` warns if its pass fraction differs from the slice's by more than `crosscheck_tolerance`.
+
+| Metric | Source | Type |
+|---|---|---|
+| `delivered_reads` | `Reads` in `read_counts_summary.txt` | exact |
+| `primer_found` | `pct_pass1_kept` in `read_counts_summary.txt` | exact |
+| `retention` | slice pass / slice demuxed | estimated |
+| `short_frac`, `long_frac`, `lowq_frac` | slice categories | estimated |
+
+Flagging, per metric, 0 = pass, 1 = check, 2 = fail; the sample's flag is the worst metric:
+
+- Absolute thresholds from `qc_config.yaml` by default.
+- If a metric's **run median** is already at CHECK or worse, a run flag is raised (e.g. `RUN: LOW_Q (median 40%, CHECK)`) and samples are judged on that metric **relative to the run**: robust z = (value - median) / max(1.4826 x MAD, `mad_floor`), CHECK at z >= 3, FAIL at z >= 5, in the bad direction only. One bad flowcell therefore raises one run flag instead of turning the whole table red. `delivered_reads` is `absolute_only` -- 15,000 reads is a deliverable floor, not a relative judgement. Fewer than `min_samples` real samples keeps absolute thresholds.
+- Samples with fewer than `min_reads_for_stats` slice reads get `NA (n<200)` in the estimated columns and are flagged on exact metrics only.
+- Controls (`Sample_Type` NTC / BLANK / POS_CTRL) are reported with flag `CTRL`.
+
+Reason codes list every non-pass metric, worst first, e.g. `FAIL: SHORT(52%);RETENTION(41%)`; relative-mode entries carry their z (`LOWQ(80%,z=6.2)`).
+
+**PASS / CHECK / FAIL is triage, not sign-off.** Review `run_qc.txt` and the heatmaps before release. Thresholds in `qc_config.yaml` are starting points and must be calibrated on past runs (including D6305 controls); bump `config_version` whenever they change -- it is recorded in every output.
+
+### Outputs -- `<output_dir>/qc_report/`
+
+| File | Contents |
+|---|---|
+| `per_sample_qc.tsv` | One row per sample: metrics, flag, reasons, Comment. `#` header records config version, slice size and which columns are estimated |
+| `per_client/<Client>_qc.tsv` | Per-client cut of the same table |
+| `run_qc.txt` | Config version, slice size, Chopper cross-check, run-level flags and medians, flag counts, `unk` / `Multiple_Matches` profile, warnings |
+| `qc_bins.tsv.gz` | Long format (sample, kind, bin, count) -- everything needed to re-threshold or re-plot |
+| `length_heatmap.png`, `q_heatmap.png` | Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised; Chopper window shaded / Q floor dashed; flag strip on the left, flagged rows labelled. Split per client above 384 rows |
+| `flagged/<Sample>.png` | Length and Q histograms for CHECK / FAIL samples |
+| `logs/minibar/` | Per-chunk Minibar logs for the slice |
+
+### Changing thresholds
+
+Edit `qc_config.yaml`, then rebuild from the saved bins without touching reads:
+
+```bash
+qsub -v output_dir=<run output dir>,report_only=1 run_qc_report.qsub
+```
+
+Changing the `filter` section needs a full re-run: the categories depend on it, and `--report-only` warns if the bins were built with a different filter.
+
+### Requirements and tests
+
+Needs PyYAML, and matplotlib for the plots (the tables are written without it). Once per user on Gadi: `module load python3/3.12.1 && pip install --user pyyaml matplotlib`. The wrapper checks for both before starting.
+
+`python tests/test_qc_report.py` builds a fake run and checks the categories, flags, the `read_counts_summary.txt` parser, relative mode and `--report-only`, using `tests/fake_minibar.py` and `tests/fake_chopper.py`.
 
 ---
 
