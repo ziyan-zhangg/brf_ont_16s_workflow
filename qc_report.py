@@ -19,7 +19,7 @@ takes seconds. Inputs:
     sample sheet                             Client, Sample_ID, Barcode,
                                              optional Sample_Type / Comment
 
-Metrics, all exact:
+Flagged metrics, all exact:
 
     delivered_reads  Reads in read_counts_summary.txt
     primer_found     pct_pass1_kept
@@ -28,7 +28,12 @@ Metrics, all exact:
                      NA in pre mode, where Chopper ran before demux.
     core_frac        reads in core_window / reads in 1,000-2,000 bp
     modal_dev_bp     |modal length - run median modal length|
-    pct_q20          in-window reads with mean Q >= 20 / in-window reads
+
+Informational, never flagged:
+
+    median_q         median mean-read-Q bin of the reads in 1,000-2,000 bp.
+                     Every delivered read already passed MinKNOW Q15, so
+                     read quality is shown but not judged.
 
 Anything < 1 kb never reaches the pipeline (MinKNOW), so a short-product
 failure can only show as low delivered reads or a low core_frac.
@@ -36,14 +41,15 @@ failure can only show as low delivered reads or a low core_frac.
 Run at the end of run_script.qsub, or by hand / run_qc_report.qsub on any
 past run. Thresholds come from qc_config.yaml; change them and re-run.
 
-PASS / CHECK / FAIL is triage, not sign-off: staff review run_qc.txt and the
-heatmaps before release.
+PASS / CHECK / FAIL is triage, not sign-off: staff review qc_report.html (or
+run_qc.txt and the heatmaps) before release.
 
 Usage:
     python3 qc_report.py \\
         --output-dir  /path/to/run_output \\
         --samplesheet /path/to/16s_samplesheet.csv \\
-        [--config qc_config.yaml] [--counts read_counts_summary.txt]
+        [--config qc_config.yaml] [--counts read_counts_summary.txt] \\
+        [--png-drilldown]
 """
 
 from __future__ import annotations
@@ -52,6 +58,8 @@ import argparse
 import csv
 import gzip
 import hashlib
+import html
+import json
 import shutil
 import statistics
 import sys
@@ -63,26 +71,33 @@ from typing import Any
 # Local imports: sibling modules in the same tools/ dir.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import filter_chopper_demux_minibar as core  # noqa: E402
-from demux_qc import BIN_WIDTH, CATCH_ALL, Q_HIGH  # noqa: E402
+from demux_qc import BIN_WIDTH, CATCH_ALL, median_q_bin  # noqa: E402
 
 log = core.log
 banner = core.banner
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "qc_config.yaml"
 
-# Metric order is also the tie-break order for reason codes.
+# Flagged metrics. Order is also the tie-break order for reason codes.
 METRICS = ("delivered_reads", "primer_found", "long_frac", "core_frac",
-           "modal_dev_bp", "pct_q20")
+           "modal_dev_bp")
+# Reported but never flagged.
+INFO_METRICS = ("median_q",)
 # NA below min_reads_for_stats; delivered_reads is always judged.
-STATS_METRICS = METRICS[1:]
+STATS_METRICS = (*METRICS[1:], *INFO_METRICS)
 REASON_CODE = {
     "delivered_reads": "READS", "primer_found": "PRIMER", "long_frac": "LONG",
-    "core_frac": "LOW_CORE", "modal_dev_bp": "MODAL", "pct_q20": "LOW_Q20",
+    "core_frac": "LOW_CORE", "modal_dev_bp": "MODAL",
 }
 RUN_CODE = {
     "delivered_reads": "LOW_READS", "primer_found": "LOW_PRIMER",
     "long_frac": "LONG", "core_frac": "LOW_CORE",
-    "modal_dev_bp": "MODAL_SPREAD", "pct_q20": "LOW_Q20",
+    "modal_dev_bp": "MODAL_SPREAD",
+}
+# Metrics dropped from the flagged set, with the warning an old config
+# that still lists them gets.
+RETIRED_METRICS = {
+    "pct_q20": "ignored: Q is no longer flagged (config v2.2)",
 }
 LEVEL_NAME = {0: "PASS", 1: "CHECK", 2: "FAIL"}
 FLAG_ORDER = {"FAIL": 0, "CHECK": 1, "PASS": 2, "CTRL": 3}
@@ -106,8 +121,9 @@ def load_config(path: Path) -> dict[str, Any]:
     try:
         import yaml
     except ImportError:
-        sys.exit("ERROR: PyYAML is required to read the QC config. On Gadi:\n"
-                 "  module load python3/3.12.1 && pip install --user pyyaml")
+        sys.exit("ERROR: PyYAML is required to read the QC config. On Gadi use "
+                 "the QC venv's python:\n"
+                 "  /g/data/vz35/ONT_16s_workflow/tools/qc_env/bin/python3")
     if not path.is_file():
         sys.exit(f"ERROR: QC config not found: {path}")
     raw = path.read_bytes()
@@ -129,6 +145,14 @@ def load_config(path: Path) -> dict[str, Any]:
     need("metrics", *METRICS)
     need("run_level", "outlier_k_check", "outlier_k_fail", "mad_floor")
     need("controls", "types")
+
+    # Retired / unknown metric entries are dropped with a warning, so an old
+    # config still runs. The caller adds _warnings to the run's warnings.
+    cfg_warnings: list[str] = []
+    for name in [m for m in cfg["metrics"] if m not in METRICS]:
+        del cfg["metrics"][name]
+        why = RETIRED_METRICS.get(name, "ignored: not a known metric")
+        cfg_warnings.append(f"{path}: metrics.{name} {why}")
 
     for name in METRICS:
         spec = cfg["metrics"][name]
@@ -161,6 +185,7 @@ def load_config(path: Path) -> dict[str, Any]:
     cfg["controls"]["types"] = [str(t).upper() for t in cfg["controls"]["types"]]
     cfg["_path"] = str(path)
     cfg["_sha256"] = hashlib.sha256(raw).hexdigest()[:12]
+    cfg["_warnings"] = cfg_warnings
     return cfg
 
 
@@ -444,7 +469,7 @@ def load_demux_qc(qc_dir: Path, sample_ids: list[str],
     if no_q:
         warnings.append(
             f"{len(no_q)} sample(s) have no <SampleID>.q.tsv (demux_qc.py "
-            f"predates the Q histogram); pct_q20 is NA for them")
+            f"predates the Q histogram); median_q is NA for them")
     return profiles
 
 
@@ -462,13 +487,12 @@ def core_frac(prof: DemuxProfile, cfg: dict[str, Any]) -> float | None:
     return num / den if den else None
 
 
-def pct_q20(prof: DemuxProfile) -> float | None:
-    """In-window reads at mean Q >= Q_HIGH, as a fraction. q bins are
-    floor(Q), so bin >= 20 is exactly Q >= 20."""
-    tot = sum(prof.q_win.values())
-    if not prof.has_q or not tot:
+def median_q(prof: DemuxProfile) -> int | None:
+    """Median floor(mean read Q) of the in-window reads (lower median).
+    Informational only: read quality is not flagged."""
+    if not prof.has_q:
         return None
-    return sum(n for q, n in prof.q_win.items() if q >= Q_HIGH) / tot
+    return median_q_bin(prof.q_win)
 
 
 # =============================================================================
@@ -552,7 +576,8 @@ def evaluate(sheet: list[SheetSample], counts: Counts,
     for s in sheet:
         row = counts.rows.get(s.sample_id)
         prof = profiles.get(s.sample_id)
-        values: dict[str, float | None] = dict.fromkeys(METRICS)
+        values: dict[str, float | None] = dict.fromkeys((*METRICS,
+                                                         *INFO_METRICS))
         na: dict[str, str] = {}
 
         if row is None:
@@ -579,7 +604,7 @@ def evaluate(sheet: list[SheetSample], counts: Counts,
                 values["long_frac"] = 1.0 - row.pct_retained / 100.0
             if prof is not None:
                 values["core_frac"] = core_frac(prof, cfg)
-                values["pct_q20"] = pct_q20(prof)
+                values["median_q"] = median_q(prof)
         modal = prof.modal_length if prof and n >= min_n else None
         results.append(SampleResult(s, n, raw, modal, values, na))
 
@@ -670,7 +695,7 @@ def run_flag_lines(runs: list[MetricRun]) -> list[str]:
 # =============================================================================
 _TSV_COLUMNS = ["client", "sample", "barcode", "location", "type",
                 "raw_demuxed", "delivered_reads", "primer_found", "long_frac",
-                "core_frac", "modal_length", "modal_dev_bp", "pct_q20",
+                "core_frac", "modal_length", "modal_dev_bp", "median_q",
                 "flag", "reasons", "comment"]
 
 
@@ -678,7 +703,7 @@ def _cell(r: SampleResult, m: str) -> str:
     v = r.values[m]
     if v is None:
         return r.na.get(m, "NA")
-    if m in ("delivered_reads", "modal_dev_bp"):
+    if m in ("delivered_reads", "modal_dev_bp", "median_q"):
         return str(int(round(v)))
     return f"{v:.4f}"
 
@@ -693,14 +718,14 @@ def write_sample_tsv(path: Path, results: list[SampleResult],
         w.writerow(_TSV_COLUMNS)
         for r in results:
             s = r.sample
-            vals = {m: _cell(r, m) for m in METRICS}
+            vals = {m: _cell(r, m) for m in (*METRICS, *INFO_METRICS)}
             w.writerow([s.client, s.sample_id, s.barcode, s.location,
                         s.sample_type,
                         "" if r.raw_demuxed is None else r.raw_demuxed,
                         vals["delivered_reads"], vals["primer_found"],
                         vals["long_frac"], vals["core_frac"],
                         "" if r.modal_length is None else r.modal_length,
-                        vals["modal_dev_bp"], vals["pct_q20"],
+                        vals["modal_dev_bp"], vals["median_q"],
                         r.flag, r.reasons, s.comment])
 
 
@@ -724,6 +749,8 @@ def tsv_header(cfg: dict[str, Any], ev: Evaluation) -> list[str]:
         f"{'NA' if ev.modal_median is None else f'{ev.modal_median:.0f}'}",
         f"fractions\t0-1; NA (n<{cfg['min_reads_for_stats']}) = too few "
         f"raw demuxed reads",
+        "median_q\tinformational, not flagged: median mean-read-Q bin of "
+        "the reads in the delivered window",
     ]
     lines += [f"run_flag\t{ln}" for ln in run_flag_lines(ev.runs)]
     return lines
@@ -809,11 +836,145 @@ def write_run_qc(path: Path, args: argparse.Namespace, cfg: dict[str, Any],
     L += [f"   - {w}" for w in warnings] or ["   none"]
     L += [
         "",
-        " PASS / CHECK / FAIL is triage, not sign-off. Review this file and",
-        " length_heatmap.png / q_heatmap.png before release.",
+        " PASS / CHECK / FAIL is triage, not sign-off. Review qc_report.html",
+        " (or this file and length_heatmap.png / q_heatmap.png) before release.",
         "========================================",
     ]
     path.write_text("\n".join(L) + "\n")
+
+
+# =============================================================================
+# Interactive HTML report (qc_report.html)
+# =============================================================================
+# One self-contained file: the page template (vanilla JS + <canvas>, no
+# external libraries or network references) with the run's data embedded as
+# a JSON blob. Standard library only, so it is written even without
+# matplotlib.
+HTML_TEMPLATE = Path(__file__).resolve().parent / "qc_report_template.html"
+
+METRIC_LABEL = {
+    "delivered_reads": "Delivered reads", "primer_found": "Primer found",
+    "long_frac": "Long reads (> 2 kb)", "core_frac": "Core window fraction",
+    "modal_dev_bp": "Modal length deviation",
+}
+
+
+def _plot_counts(prof: DemuxProfile | None, kind: str) -> list[int]:
+    """Counts per plot bin (see _edges), end bins clamped."""
+    edges = _edges(kind)
+    step = edges[1] - edges[0]
+    out = [0] * len(edges)
+    for b, n in _plot_bins(prof, kind).items():
+        out[(b - edges[0]) // step] += n
+    return out
+
+
+def _run_median_profile(rows: list[list[int]]) -> list[float] | None:
+    """Per-bin median of the row-normalised profiles, as a reference line."""
+    fracs = [[c / sum(r) for c in r] for r in rows if sum(r)]
+    if not fracs:
+        return None
+    return [round(statistics.median(col), 6) for col in zip(*fracs)]
+
+
+def _json_num(v: float | None) -> float | int | None:
+    if v is None:
+        return None
+    return v if isinstance(v, int) else round(float(v), 6)
+
+
+def html_data(args: argparse.Namespace, cfg: dict[str, Any], ev: Evaluation,
+              profiles: dict[str, DemuxProfile],
+              warnings: list[str]) -> dict[str, Any]:
+    f, cw, rl = cfg["filter"], cfg["core_window"], cfg["run_level"]
+    controls = set(cfg["controls"]["types"])
+    by_metric = {mr.metric: mr for mr in ev.runs}
+
+    metrics = []
+    for m in METRICS:
+        spec, mr = cfg["metrics"][m], by_metric[m]
+        metrics.append({
+            "key": m, "label": METRIC_LABEL[m], "code": REASON_CODE[m],
+            "direction": spec["direction"], "check": spec["check"],
+            "fail": spec["fail"], "relative": mr.relative,
+            "run_level": mr.run_level, "median": _json_num(mr.median),
+        })
+
+    samples, real_len, real_q = [], [], []
+    for r in ev.results:
+        s, prof = r.sample, profiles.get(r.sample.sample_id)
+        lc, qc_ = _plot_counts(prof, "len"), _plot_counts(prof, "q")
+        if s.sample_type not in controls:
+            real_len.append(lc)
+            real_q.append(qc_)
+        samples.append({
+            "id": s.sample_id, "client": s.client, "barcode": s.barcode,
+            "location": s.location, "type": s.sample_type,
+            "comment": s.comment, "order": s.order,
+            "flag": r.flag, "reasons": r.reasons, "n": r.n,
+            "raw": r.raw_demuxed, "modal_length": r.modal_length,
+            "values": {m: _json_num(v) for m, v in r.values.items()},
+            "na": r.na, "levels": r.levels,
+            "z": {m: round(z, 3) for m, z in r.z.items()},
+            "len": lc, "q": qc_,
+        })
+
+    total = sum(p.reads for p in profiles.values())
+    catch_all = []
+    for sid in CATCH_ALL:
+        n = profiles[sid].reads if sid in profiles else 0
+        catch_all.append({"sample": sid, "reads": n,
+                          "share": 100.0 * n / total if total else 0.0})
+
+    len_edges, q_edges = _edges("len"), _edges("q")
+    return {
+        "run": {
+            "name": args.output_dir.resolve().name,
+            "output_dir": str(args.output_dir),
+            "generated": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+            "config_version": config_label(cfg),
+            "filter_stage": ev.filter_stage,
+            "filter_stage_note": _stage_note(ev.filter_stage),
+            "flag_counts": {fl: sum(r.flag == fl for r in ev.results)
+                            for fl in ("PASS", "CHECK", "FAIL", "CTRL")},
+            "run_flags": run_flag_lines(ev.runs),
+            "warnings": list(warnings),
+            "catch_all": catch_all,
+            "core_window": {"min": cw["min"], "max": cw["max"]},
+            "delivered": {"min": f["minknow_min_len"],
+                          "max": f["chopper_max_len"]},
+            "k_check": rl["outlier_k_check"], "k_fail": rl["outlier_k_fail"],
+            "windows_note": (
+                f"Delivered window {f['minknow_min_len']}-"
+                f"{f['chopper_max_len']} bp; core window {cw['min']}-"
+                f"{cw['max']} bp; config {config_label(cfg)}."),
+        },
+        "axes": {
+            "len": {"min": len_edges[0], "max": len_edges[-1],
+                    "step": len_edges[1] - len_edges[0], "n": len(len_edges)},
+            "q": {"min": q_edges[0], "max": q_edges[-1],
+                  "step": q_edges[1] - q_edges[0], "n": len(q_edges)},
+        },
+        "run_median": {"len": _run_median_profile(real_len),
+                       "q": _run_median_profile(real_q)},
+        "metrics": metrics,
+        "samples": samples,
+    }
+
+
+def write_html(path: Path, data: dict[str, Any]) -> None:
+    if not HTML_TEMPLATE.is_file():
+        sys.exit(f"ERROR: HTML template not found: {HTML_TEMPLATE} -- it must "
+                 f"sit beside qc_report.py")
+    # '<' escaped so no string in the data (a sample Comment, say) can close
+    # the <script> element early; < is still valid JSON.
+    blob = json.dumps(data, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":")).replace("<", "\\u003c")
+    title = html.escape(f"16S QC report - {data['run']['name']}")
+    page = (HTML_TEMPLATE.read_text(encoding="utf-8")
+            .replace("__TITLE__", title)
+            .replace("__QC_DATA__", blob))
+    path.write_text(page, encoding="utf-8")
 
 
 # =============================================================================
@@ -870,13 +1031,13 @@ def _matrix(rows: list[SampleResult], profiles: dict[str, DemuxProfile],
 
 
 def _guides(ax: Any, cfg: dict[str, Any], kind: str) -> None:
+    """Length: shaded core window, dashed lines at the delivered window ends.
+    Q is informational, so it gets no threshold line."""
     f, cw = cfg["filter"], cfg["core_window"]
     if kind == "len":
         ax.axvspan(cw["min"], cw["max"], color=_INK, alpha=0.08, lw=0)
-        ax.axvline(f["chopper_max_len"], color=_GUIDE, lw=1.0)
-    else:
-        ax.axvline(Q_HIGH, color=_GUIDE, lw=1.0)
-        ax.axvline(f["minknow_min_q"], color=_INK2, lw=0.8, ls="--")
+        for x in (f["minknow_min_len"], f["chopper_max_len"]):
+            ax.axvline(x, color=_GUIDE, lw=1.0, ls="--")
 
 
 def _xlabel(cfg: dict[str, Any], kind: str) -> str:
@@ -884,11 +1045,12 @@ def _xlabel(cfg: dict[str, Any], kind: str) -> str:
     if kind == "len":
         return (f"Read length (bp, {BIN_WIDTH} bp bins; end bins hold "
                 f"< {LEN_PLOT_MIN} / >= {LEN_PLOT_MAX}). Band = core window "
-                f"{cw['min']}-{cw['max']} bp; red line = Chopper max "
+                f"{cw['min']}-{cw['max']} bp; dashed = MinKNOW min "
+                f"{f['minknow_min_len']} bp and Chopper max "
                 f"{f['chopper_max_len']} bp")
     return (f"Mean read Q of reads in {f['minknow_min_len']}-"
             f"{f['chopper_max_len']} bp (integer bins; end bins clamped). "
-            f"Red = Q{Q_HIGH}; dashed = MinKNOW Q{f['minknow_min_q']}")
+            f"Informational only -- read quality is not flagged")
 
 
 def plot_heatmap(path: Path, rows: list[SampleResult],
@@ -995,17 +1157,24 @@ def plot_flagged(path: Path, r: SampleResult, prof: DemuxProfile | None,
 
 def write_plots(qc_dir: Path, ev: Evaluation,
                 profiles: dict[str, DemuxProfile], cfg: dict[str, Any],
-                warnings: list[str]) -> None:
+                warnings: list[str], png_drilldown: bool = False) -> None:
+    """Static PNG copies for email / records; qc_report.html is the main
+    review view. Per-sample PNGs only with --png-drilldown."""
+    for old in qc_dir.glob("*_heatmap*.png"):
+        old.unlink()
+    # Stale drill-downs from an earlier run would no longer match the flags.
+    flagged_dir = qc_dir / "flagged"
+    if flagged_dir.is_dir():
+        shutil.rmtree(flagged_dir)
+
     try:
         import matplotlib
         matplotlib.use("Agg")
     except ImportError:
-        warnings.append("matplotlib not available; heatmaps and flagged "
-                        "plots were not drawn (pip install --user matplotlib)")
+        warnings.append("matplotlib not available; static PNG heatmaps were "
+                        "not drawn (qc_report.html is unaffected)")
         return
 
-    for old in qc_dir.glob("*_heatmap*.png"):
-        old.unlink()
     ordered = sorted(ev.results, key=lambda r: (FLAG_ORDER[r.flag],
                                                 r.sample.order, r.sample.barcode))
     if len(ordered) <= HEATMAP_MAX_ROWS:
@@ -1019,17 +1188,15 @@ def write_plots(qc_dir: Path, ev: Evaluation,
     for client, rows in groups:
         suffix = f"_{client}" if client else ""
         for kind, stem, label in (("len", "length_heatmap", "Read length"),
-                                  ("q", "q_heatmap", "Mean read Q")):
+                                  ("q", "q_heatmap",
+                                   "Mean read Q, informational")):
             title = (f"{label} by sample ({when})"
                      + (f" -- {client}" if client else ""))
             plot_heatmap(qc_dir / f"{stem}{suffix}.png", rows, profiles, cfg,
                          kind, title)
 
-    flagged_dir = qc_dir / "flagged"
-    if flagged_dir.is_dir():
-        shutil.rmtree(flagged_dir)
     flagged = [r for r in ev.results if r.flag in ("CHECK", "FAIL")]
-    if flagged:
+    if png_drilldown and flagged:
         flagged_dir.mkdir(parents=True, exist_ok=True)
         for r in flagged:
             plot_flagged(flagged_dir / f"{r.sample.sample_id}.png", r,
@@ -1056,6 +1223,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "<output-dir>/run_log_*/, else <output-dir>/).")
     p.add_argument("--demux-qc-dir", type=Path, default=None,
                    help="demux_qc.py output (default: <output-dir>/demux_qc).")
+    p.add_argument("--png-drilldown", action="store_true",
+                   help="Also write flagged/<Sample>.png (length + Q "
+                        "histograms) for CHECK / FAIL samples. qc_report.html "
+                        "has the same drill-down interactively.")
     args = p.parse_args(argv)
     if args.demux_qc_dir is None:
         args.demux_qc_dir = args.output_dir / "demux_qc"
@@ -1066,12 +1237,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_config(args.config)
     qc_dir = args.output_dir / "qc_report"
-    warnings: list[str] = []
+    warnings: list[str] = list(cfg["_warnings"])
 
     if not args.output_dir.is_dir():
         sys.exit(f"ERROR: output dir not found: {args.output_dir}")
     banner("QC REPORT: per-sample PASS / CHECK / FAIL")
     log(f" QC config: {cfg['_path']}  version {config_label(cfg)}")
+    for w in cfg["_warnings"]:
+        log(f" WARNING: {w}")
 
     sheet = load_samplesheet(args.samplesheet, cfg["controls"]["types"])
     if args.counts is not None:
@@ -1115,7 +1288,9 @@ def main(argv: list[str] | None = None) -> int:
                          [r for r in ev.results if r.sample.client == client],
                          header)
     write_bins(qc_dir / "qc_bins.tsv.gz", profiles)
-    write_plots(qc_dir, ev, profiles, cfg, warnings)
+    write_plots(qc_dir, ev, profiles, cfg, warnings, args.png_drilldown)
+    write_html(qc_dir / "qc_report.html",
+               html_data(args, cfg, ev, profiles, warnings))
     write_run_qc(qc_dir / "run_qc.txt", args, cfg, counts, ev, profiles,
                  warnings)
 
@@ -1126,7 +1301,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f" {flag:<6} {sum(r.flag == flag for r in ev.results):>5}")
     if warnings:
         log(f" {len(warnings)} warning(s); see run_qc.txt")
-    log(f" Report: {qc_dir}")
+    log(f" Report: {qc_dir / 'qc_report.html'}")
     log(f" QC report complete: {datetime.now():%Y-%m-%d %H:%M:%S}")
     log("========================================")
     return 0

@@ -6,8 +6,13 @@
 #
 # Thresholds are starting points -- calibrate on past runs (incl. D6305
 # controls) before relying on them. delivered_reads.fail is a placeholder.
+#
+# Read quality is not flagged (v2.2): every delivered read already passed
+# MinKNOW Q15, and Q20 is an unreasonable bar for ONT 16S. The Q histogram is
+# still shown, and median_q reported, for information only. An old config
+# that still lists pct_q20 is accepted with a warning; the entry is ignored.
 
-config_version: 2.0
+config_version: 2.2
 
 filter:                       # informational; must mirror production
   minknow_min_len: 1000       # MinKNOW drops shorter reads from fastq_pass
@@ -36,7 +41,6 @@ metrics:
   long_frac:       {direction: lower_better,  check: 0.05, fail: 0.15}
   core_frac:       {direction: higher_better, check: 0.75, fail: 0.50}
   modal_dev_bp:    {direction: lower_better,  check: 50,   fail: 100, absolute_only: true}
-  pct_q20:         {direction: higher_better, check: 0.60, fail: 0.40}
 
 run_level:
   outlier_k_check: 3          # robust z >= 3 in the bad direction -> Check

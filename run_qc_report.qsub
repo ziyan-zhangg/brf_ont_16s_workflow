@@ -31,10 +31,21 @@
 # pass the real dir with -v output_dir=... rather than relying on today's
 # date here; the job stops with an error if the dir does not exist.
 #
-# Python packages: needs PyYAML, and matplotlib for the plots (the tables are
-# still written without it). If the preflight below fails, once per user:
+# Main output: <output_dir>/qc_report/qc_report.html (self-contained; open it
+# from anywhere, no network needed). Add --png-drilldown to the qc_report.py
+# call below for per-sample PNGs of flagged samples.
 #
-#   module load python3/3.12.1 && pip install --user pyyaml matplotlib
+# Python packages: PyYAML, and matplotlib for the static PNGs (the tables and
+# qc_report.html are written without it), from the shared venv in qc_python.
+# If the preflight below fails, (re)create the venv:
+#
+#   module load python3/3.12.1
+#   python3 -m venv /g/data/vz35/ONT_16s_workflow/tools/qc_env
+#   /g/data/vz35/ONT_16s_workflow/tools/qc_env/bin/pip install pyyaml matplotlib
+#
+# Test a dev copy without editing this script:
+#
+#   qsub -v output_dir=<run>,tools_dir=<dev checkout> run_qc_report.qsub
 #-----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -50,9 +61,10 @@ samplesheet=${samplesheet:-/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_sample
 output_dir=${output_dir:-/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_${date_stamp}}
 
 #--------DONT-CHANGE----------------------------------------------------------
-tools_dir=/g/data/vz35/ONT_16s_workflow/tools/brf_ont_16s_workflow/
+tools_dir=${tools_dir:-/g/data/vz35/ONT_16s_workflow/tools/brf_ont_16s_workflow/}
 qc_script=${tools_dir}/qc_report.py
 qc_config=${qc_config:-${tools_dir}/qc_config.yaml}
+qc_python=${qc_python:-/g/data/vz35/ONT_16s_workflow/tools/qc_env/bin/python3}
 
 if [[ ! -d "$output_dir" ]]; then
     echo "ERROR: output_dir not found: ${output_dir}" >&2
@@ -60,13 +72,17 @@ if [[ ! -d "$output_dir" ]]; then
     exit 1
 fi
 
-if ! python3 -c "import yaml" 2>/dev/null; then
-    echo "ERROR: PyYAML not available. Once per user:" >&2
-    echo "       module load python3/3.12.1 && pip install --user pyyaml matplotlib" >&2
+if [[ ! -x "$qc_python" ]]; then
+    echo "ERROR: QC venv python not found: ${qc_python}" >&2
+    echo "       see the 'Python packages' note at the top of this script" >&2
     exit 1
 fi
-if ! python3 -c "import matplotlib" 2>/dev/null; then
-    echo "WARNING: matplotlib not available; tables only, no heatmaps." >&2
+if ! "$qc_python" -c "import yaml" 2>/dev/null; then
+    echo "ERROR: PyYAML missing from ${qc_python}" >&2
+    exit 1
+fi
+if ! "$qc_python" -c "import matplotlib" 2>/dev/null; then
+    echo "WARNING: matplotlib missing from ${qc_python}; no PNG heatmaps (tables and qc_report.html still written)." >&2
 fi
 
 echo "========================================"
@@ -76,7 +92,7 @@ echo " Samplesheet: ${samplesheet}"
 echo " Config:      ${qc_config}"
 echo "========================================"
 
-python3 "$qc_script" \
+"$qc_python" "$qc_script" \
     --output-dir  "$output_dir" \
     --samplesheet "$samplesheet" \
     --config      "$qc_config"

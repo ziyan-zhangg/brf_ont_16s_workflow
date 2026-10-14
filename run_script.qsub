@@ -137,6 +137,7 @@ generate_primer_script=${tools_dir}/generate_primer_setup.py # attention to loca
 core_script=${tools_dir}/filter_chopper_demux_minibar.py # attention to location
 qc_script=${tools_dir}/qc_report.py
 qc_config=${tools_dir}/qc_config.yaml
+qc_python=/g/data/vz35/ONT_16s_workflow/tools/qc_env/bin/python3
 
 primer_output_dir=/g/data/vz35/ONT_16s_workflow/sample_sheet
 primer_file="${primer_output_dir}/16S_primer_setup_${date_stamp}.txt"
@@ -204,14 +205,18 @@ python3 "$core_script" \
 # POST-STEP: per-sample QC report (reads demux_qc/ + read_counts_summary.txt)
 #=============================================================================
 # Takes seconds. Deliverables are already in place by now, so a QC failure
-# (e.g. PyYAML missing) is reported but does not fail the job; re-run it by
-# hand or with run_qc_report.qsub.
+# is reported but does not fail the job; re-run it by hand or with
+# run_qc_report.qsub. Uses the qc_env venv (PyYAML, matplotlib) via its own
+# python, so the core pipeline's environment is untouched.
 if [[ "$run_qc_report" == "1" ]]; then
-    if python3 "$qc_script" \
+    if [[ ! -x "$qc_python" ]]; then
+        echo "WARNING: QC venv python not found at ${qc_python}; skipping QC report." >&2
+        echo "         Re-run with: qsub -v output_dir=${output_dir} run_qc_report.qsub" >&2
+    elif "$qc_python" "$qc_script" \
         --output-dir  "$output_dir" \
         --samplesheet "$samplesheet" \
         --config      "$qc_config"; then
-        echo " QC report: ${output_dir}/qc_report/run_qc.txt"
+        echo " QC report: ${output_dir}/qc_report/qc_report.html"
     else
         echo "WARNING: qc_report.py failed; pipeline outputs are unaffected." >&2
         echo "         Re-run with: qsub -v output_dir=${output_dir} run_qc_report.qsub" >&2

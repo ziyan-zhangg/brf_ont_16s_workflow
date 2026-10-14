@@ -63,6 +63,7 @@ filter_chopper_demux_minibar.py  # Core pipeline: Steps 1-7
 demux_qc.py                      # Step 3: per-sample demux QC (imported by core script)
 cutadapt_2pass.py                # Step 5: two-pass cutadapt (imported by core script)
 qc_report.py                     # Post-step: per-sample QC report (reads demux_qc/ + counts)
+qc_report_template.html          # Page template for qc_report.html (must sit beside qc_report.py)
 qc_config.yaml                   # QC report thresholds, versioned
 run_qc_report.qsub               # PBS wrapper to re-run qc_report.py on a finished run
 ```
@@ -247,7 +248,7 @@ Per-file Minibar subdirectories are removed after merging to save storage. In `p
 | Raw demuxed read count | Reads Minibar assigned to that barcode |
 | Length histogram | 50 bp bins, plus exact N50, median, and modal length |
 | Mean read Q | Per-read mean error probability converted to Phred, then averaged over reads |
-| Q histogram | Integer bins of that per-read mean Q, for all reads and for reads inside `[minlength, maxlength]`; `pct_q20` = % of in-window reads at Q ≥ 20 |
+| Q histogram | Integer bins of that per-read mean Q, for all reads and for reads inside `[minlength, maxlength]`; `median_q` = median bin of the in-window reads. For display only -- read quality is not flagged |
 | % within window | Share of reads inside `[minlength, maxlength]` |
 
 `sample_unk` and `sample_Multiple_Matches` are profiled too — an inflated unassigned bin is the first sign of a demux problem, and its length profile says whether the cause is chemistry or barcode matching.
@@ -258,7 +259,7 @@ Outputs, written to `demux_qc/`:
 |------|----------|
 | `<SampleID>.tsv` | One row per 50 bp bin; scalar stats in a `#`-prefixed header block (read with `pandas.read_csv(..., sep='\t', comment='#')`) |
 | `<SampleID>.q.tsv` | One row per integer mean-Q bin: `q_bin`, `count_all`, `count_in_window`; same `#` header convention |
-| `demux_qc_summary.tsv` | One row per sample, all scalar stats (incl. `pct_q20`), real samples first |
+| `demux_qc_summary.tsv` | One row per sample, all scalar stats (incl. `median_q`), real samples first |
 
 No read is altered.
 
@@ -377,6 +378,10 @@ minibar_output/ONT_16S_TBC_<date>/
 
 `qc_report.py` produces one table per run with one row per sample, a PASS / CHECK / FAIL flag and reason codes, plus run-level verdicts and length/Q heatmaps. It judges only what the facility is responsible for -- did the sample amplify and sequence into usable reads. Chimera %, classified / unclassified reads and NTC read ratios are the client's responsibility and are not reported.
 
+**Read quality is not flagged.** Every delivered read already passed MinKNOW Q15, and Q20 is an unreasonable bar for ONT 16S. The Q distribution is still shown (heatmap and drill-down), and `median_q` is reported, for information only.
+
+The main output is **`qc_report/qc_report.html`**: a single self-contained page (no network access needed -- open it from Gadi, a shared drive or an email attachment) with the run summary, interactive length and Q heatmaps, a click-to-drill-down view per sample and a sortable table.
+
 It is a pure reader of `demux_qc/` and `read_counts_summary.txt`: no FASTQ access, no Minibar, no Chopper. It takes seconds and runs automatically at the end of `run_script.qsub` (`run_qc_report=1`). A QC failure there is reported but does not fail the job. To re-run it -- after changing thresholds, on a past run, or if the in-job report failed:
 
 ```bash
@@ -387,7 +392,7 @@ python3 qc_report.py --output-dir <run output dir> --samplesheet <sheet.csv>
 
 Pass `output_dir` explicitly: `run_script.qsub` stamps it with the date its job *starts*, which is not necessarily the day you submit.
 
-### Metrics (all exact)
+### Metrics (all exact; five flagged)
 
 | Metric | Source | Better | Catches |
 |---|---|---|---|
@@ -396,44 +401,54 @@ Pass `output_dir` explicitly: `run_script.qsub` stamps it with the date its job 
 | `long_frac` | 1 − `pct_retained` (post mode only) | lower | Chimeras, concatemers, ligation artefacts (> 2 kb) |
 | `core_frac` | `demux_qc` length histogram: reads in `core_window` (default 1,300–1,700 bp) / reads in 1,000–2,000 bp | higher | Truncated / partial amplicons at 1,000–1,300 bp |
 | `modal_dev_bp` | \|modal length − run median modal length\| | lower | Wrong product / assay mix-up |
-| `pct_q20` | `demux_qc` Q histogram: in-window reads at mean Q ≥ 20 | higher | Quality hugging the Q15 floor |
 
-`core_frac` and `pct_q20` are computed on reads within 1,000–2,000 bp, so they describe the delivered population. `raw_demuxed` in the table is Minibar's count before Chopper.
+Informational, never flagged: `median_q`, the median mean-read-Q bin from the `demux_qc` Q histogram.
+
+`core_frac` and `median_q` are computed on reads within 1,000–2,000 bp, so they describe the delivered population. `raw_demuxed` in the table is Minibar's count before Chopper.
 
 **Known limit.** Anything < 1 kb is discarded by MinKNOW and never reaches the pipeline, so short-product failures (e.g. BP_001 / BP_007 type) can only show up as low `delivered_reads` or a low `core_frac`. Short and low-Q fractions cannot be measured per sample.
 
-**Pre-mode runs.** Chopper ran before Minibar, so no > 2 kb reads were demultiplexed: `long_frac` is `NA (pre mode)` for every sample and `run_qc.txt` says so at the top. The other metrics still work. Runs whose `demux_qc/` predates the Q histogram get `pct_q20 = NA`, with a warning.
+**Pre-mode runs.** Chopper ran before Minibar, so no > 2 kb reads were demultiplexed: `long_frac` is `NA (pre mode)` for every sample and `run_qc.txt` says so at the top. The other metrics still work. Runs whose `demux_qc/` predates the Q histogram get `median_q = NA`, with a warning.
 
 ### Flagging
 
 Per metric 0 = pass, 1 = check, 2 = fail; the sample's flag is the worst metric.
 
 - Absolute thresholds from `qc_config.yaml` by default.
-- If a metric's **run median** is already at CHECK or worse, a run flag is raised (e.g. `RUN: LOW_Q20 (median 35%, FAIL)`) and samples are judged on that metric **relative to the run**: robust z = (value − median) / max(1.4826 × MAD, `mad_floor`), CHECK at z ≥ 3, FAIL at z ≥ 5, in the bad direction only. One bad flowcell therefore raises one run flag instead of turning the whole table red. Fewer than `min_samples` real samples keeps absolute thresholds.
+- If a metric's **run median** is already at CHECK or worse, a run flag is raised (e.g. `RUN: LONG (median 18%, FAIL)`) and samples are judged on that metric **relative to the run**: robust z = (value − median) / max(1.4826 × MAD, `mad_floor`), CHECK at z ≥ 3, FAIL at z ≥ 5, in the bad direction only. One bad flowcell therefore raises one run flag instead of turning the whole table red. Fewer than `min_samples` real samples keeps absolute thresholds.
 - `delivered_reads` and `modal_dev_bp` are `absolute_only`: 15,000 reads is a deliverable floor, and `modal_dev_bp` is already relative to the run.
 - Samples with fewer than `min_reads_for_stats` (200) raw demultiplexed reads get `NA (n<200)` in every metric except `delivered_reads`, which is still flagged.
 - Controls (`Sample_Type` NTC / BLANK / POS_CTRL) are reported with flag `CTRL` and left out of every run median.
 
-Reason codes list every non-pass metric, worst first, e.g. `FAIL: LOW_CORE(48%);LONG(22%)`; relative-mode entries carry their z (`LOW_Q20(5%,z=13.3)`). Codes: `READS`, `PRIMER`, `LONG`, `LOW_CORE`, `MODAL`, `LOW_Q20`.
+Reason codes list every non-pass metric, worst first, e.g. `FAIL: LOW_CORE(48%);LONG(22%)`; relative-mode entries carry their z (`PRIMER(30%,z=17.8)`). Codes: `READS`, `PRIMER`, `LONG`, `LOW_CORE`, `MODAL`.
 
-**PASS / CHECK / FAIL is triage, not sign-off.** Review `run_qc.txt` and the heatmaps before release. Thresholds in `qc_config.yaml` are starting points and must be calibrated on past runs (including D6305 controls); bump `config_version` whenever they change -- it is recorded in every output. Set `core_window` from the observed modal length.
+**PASS / CHECK / FAIL is triage, not sign-off.** Review `qc_report.html` (or `run_qc.txt` and the heatmaps) before release. Thresholds in `qc_config.yaml` are starting points and must be calibrated on past runs (including D6305 controls); bump `config_version` whenever they change -- it is recorded in every output. Set `core_window` from the observed modal length. An older config that still lists `pct_q20` runs with a warning (`ignored: Q is no longer flagged`).
 
 ### Outputs -- `<output_dir>/qc_report/`
 
 | File | Contents |
 |---|---|
-| `per_sample_qc.tsv` | One row per sample: client, sample, barcode, type, `raw_demuxed`, every metric, `modal_length`, flag, reasons, Comment. `#` header records config version, filter stage and windows |
+| `qc_report.html` | **Main review view.** One self-contained file (data embedded as JSON, inline JS/CSS, no external libraries or network). Header with filter stage, config version, flag counts and run-level flags; filter by client / flag / sample name and sort by any column; length and Q heatmaps side by side (hover for details); click a row for that sample's length and Q histograms against the run median, each metric's PASS / CHECK / FAIL badge and threshold, reasons and Comment; sortable table of all samples. Written with the standard library only, so it is produced even without matplotlib |
+| `per_sample_qc.tsv` | One row per sample: client, sample, barcode, type, `raw_demuxed`, every metric, `modal_length`, `median_q` (info), flag, reasons, Comment. `#` header records config version, filter stage and windows |
 | `per_client/<Client>_qc.tsv` | Per-client cut of the same table |
 | `run_qc.txt` | Config version, filter stage, windows, run-level flags and medians, flag counts, `unk` / `Multiple_Matches` share, warnings |
 | `qc_bins.tsv.gz` | Long format (sample, kind, bin, count); kind `len` (50 bp, all reads), `q` (in-window reads), `q_all` -- for re-plotting / re-thresholding |
-| `length_heatmap.png`, `q_heatmap.png` | Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised. Length axis 1–4 kb shows the > 2 kb tail, core window shaded, line at 2,000 bp; Q axis has lines at Q20 and Q15. Flag strip on the left, flagged rows labelled. Split per client above 384 rows |
-| `flagged/<Sample>.png` | Length and Q histograms for CHECK / FAIL samples |
+| `length_heatmap.png`, `q_heatmap.png` | Static copies for email / records. Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised. Length axis 1–4 kb shows the > 2 kb tail, core window shaded, dashed lines at 1,000 and 2,000 bp; the Q heatmap is informational and has no threshold line. Flag strip on the left, flagged rows labelled. Split per client above 384 rows |
+| `flagged/<Sample>.png` | Only with `--png-drilldown`: length and Q histograms for CHECK / FAIL samples (the HTML report has the same drill-down) |
 
 ### Requirements and tests
 
-Needs PyYAML, and matplotlib for the plots (the tables are written without it). Once per user on Gadi: `module load python3/3.12.1 && pip install --user pyyaml matplotlib`. The wrapper checks for both before starting.
+Needs PyYAML, and matplotlib for the static PNGs (the tables and `qc_report.html` are written without it). Both come from the shared venv `/g/data/vz35/ONT_16s_workflow/tools/qc_env`; `run_script.qsub` and `run_qc_report.qsub` call its python directly (`qc_python=.../qc_env/bin/python3`) after `module load python3/3.12.1`, so the core pipeline's environment is untouched. The wrapper checks for both packages before starting. To (re)create the venv:
 
-`python tests/test_qc_report.py` builds fake runs in post and pre mode (real `demux_qc` + production `read_counts_summary.txt` writer) and checks the Q bins against a direct calculation, every metric and flag, the counts parser incl. pre-mode NA handling, relative mode and controls.
+```bash
+module load python3/3.12.1
+python3 -m venv /g/data/vz35/ONT_16s_workflow/tools/qc_env
+/g/data/vz35/ONT_16s_workflow/tools/qc_env/bin/pip install pyyaml matplotlib
+```
+
+`tools_dir` (and `qc_python`, `qc_config`) can be overridden with `qsub -v`, so a dev copy can be tested without editing the scripts: `qsub -v output_dir=<run>,tools_dir=<dev checkout> run_qc_report.qsub`.
+
+`python tests/test_qc_report.py` builds fake runs in post and pre mode (real `demux_qc` + production `read_counts_summary.txt` writer) and checks the Q bins and `median_q` against a direct calculation, every metric and flag (Q never flagged), the counts parser incl. pre-mode NA handling, relative mode, controls, the old-config `pct_q20` warning, and that `qc_report.html` parses, contains every sample, has no `http://` / `https://` references and is still written without matplotlib.
 
 ---
 

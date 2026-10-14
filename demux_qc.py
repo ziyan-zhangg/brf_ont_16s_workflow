@@ -19,7 +19,8 @@ For every sample_<SampleID>.fastq in the integrated demultiplexing directory
     * length histogram in 50 bp bins, plus N50 and modal length
     * mean read Q (per-read mean error probability -> Phred, averaged)
     * integer mean-read-Q histogram, for all reads and for the reads inside
-      [minlength, maxlength], and % of in-window reads at Q >= 20
+      [minlength, maxlength], and the median Q of the in-window reads
+      (for display only -- read quality is not flagged)
     * % of reads falling inside [minlength, maxlength]
 
 Outputs, all under <output_dir>/demux_qc/:
@@ -48,9 +49,6 @@ from typing import BinaryIO, Callable
 
 # Width of the length histogram bins, in bp.
 BIN_WIDTH = 50
-
-# pct_q20: share of in-window reads whose mean read Q is at least this.
-Q_HIGH = 20
 
 # Minibar's catch-all output bins. These are not real samples but are still
 # reported: an inflated sample_unk is the first sign of a demux problem, and
@@ -117,12 +115,9 @@ class SampleQC:
         return 100.0 * self.reads_in_window / self.reads if self.reads else 0.0
 
     @property
-    def pct_q20(self) -> float:
-        """% of in-window reads with mean read Q >= Q_HIGH."""
-        if not self.reads_in_window:
-            return 0.0
-        hi = sum(n for q, n in self.q_counts_in_window.items() if q >= Q_HIGH)
-        return 100.0 * hi / self.reads_in_window
+    def median_q(self) -> int | None:
+        """Median Q bin of the in-window reads; informational, not flagged."""
+        return median_q_bin(self.q_counts_in_window)
 
     def histogram(self) -> list[tuple[int, int]]:
         """(bin_start, count) for every 50 bp bin from the shortest to the
@@ -136,6 +131,25 @@ class SampleQC:
         lo = min(binned)
         hi = max(binned)
         return [(b, binned.get(b, 0)) for b in range(lo, hi + BIN_WIDTH, BIN_WIDTH)]
+
+
+def median_q_bin(q_counts: dict[int, int]) -> int | None:
+    """Lower median of a floor(mean read Q) histogram, i.e. the Q bin holding
+    read number ceil(n/2) in ascending order. None for an empty histogram."""
+    total = sum(q_counts.values())
+    if not total:
+        return None
+    rank = (total + 1) // 2
+    seen = 0
+    for q in sorted(q_counts):
+        seen += q_counts[q]
+        if seen >= rank:
+            return q
+    return None
+
+
+def _fmt_q(q: int | None) -> str:
+    return "NA" if q is None else str(q)
 
 
 def scan_fastq(
@@ -232,7 +246,7 @@ _SUMMARY_COLUMNS = [
     "sample", "category", "reads", "total_bp", "min_length", "max_length",
     "mean_length", "median_length", "n50", "modal_length", "modal_bin",
     "modal_bin_count", "mean_read_q", "window_min", "window_max",
-    "reads_in_window", "pct_in_window", "pct_q20",
+    "reads_in_window", "pct_in_window", "median_q",
 ]
 
 
@@ -255,7 +269,7 @@ def _summary_row(qc: SampleQC) -> list[str]:
         str(qc.window_max),
         str(qc.reads_in_window),
         f"{qc.pct_in_window:.2f}",
-        f"{qc.pct_q20:.2f}",
+        _fmt_q(qc.median_q),
     ]
 
 
@@ -287,7 +301,7 @@ def write_sample_tsv(qc: SampleQC, dest: Path, filter_stage: str, source: Path) 
         f"# length_window\t{qc.window_min}-{qc.window_max}",
         f"# reads_in_window\t{qc.reads_in_window}",
         f"# pct_in_window\t{qc.pct_in_window:.2f}",
-        f"# pct_q20\t{qc.pct_q20:.2f}",
+        f"# median_q\t{_fmt_q(qc.median_q)}",
         "bin_start\tbin_end\tcount\tpct_of_reads\tcum_pct",
     ]
 
@@ -318,7 +332,7 @@ def write_q_tsv(qc: SampleQC, dest: Path, filter_stage: str) -> None:
         f"# length_window\t{qc.window_min}-{qc.window_max}",
         f"# reads\t{qc.reads}",
         f"# reads_in_window\t{qc.reads_in_window}",
-        f"# pct_q20\t{qc.pct_q20:.2f}",
+        f"# median_q\t{_fmt_q(qc.median_q)}",
         "q_bin\tcount_all\tcount_in_window",
     ]
     if qc.q_counts:
@@ -383,7 +397,7 @@ def run_demux_qc(
             f"mode={qc.modal_bin_start}-{qc.modal_bin_start + BIN_WIDTH - 1}  "
             f"meanQ={qc.mean_read_q:>5.2f}  "
             f"in {minlength}-{maxlength}bp={qc.pct_in_window:>6.2f}%  "
-            f"Q{Q_HIGH}+={qc.pct_q20:>6.2f}%"
+            f"medianQ={_fmt_q(qc.median_q):>3}"
         )
 
     summary = qc_dir / "demux_qc_summary.tsv"

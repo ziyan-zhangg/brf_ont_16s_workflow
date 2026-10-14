@@ -1,0 +1,700 @@
+<!doctype html>
+<!--
+  Template for qc_report.html, filled in by qc_report.py (write_html): the
+  title and the qc-data JSON placeholders are replaced, everything else is
+  used as is. Do not write the placeholder names anywhere else in this file.
+  Must stay fully self-contained: no CDN, no external fonts or libraries, no
+  network references of any kind -- the report has to open offline from a
+  Gadi copy, a shared drive or an email attachment.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  --bg: #fcfcfb; --panel: #ffffff; --ink: #0b0b0b; --ink2: #52514e;
+  --muted: #898781; --line: #e1e0d9; --line2: #c3c2b7; --accent: #2a78d6;
+  --pass: #0ca30c; --check: #fab219; --fail: #d03b3b; --ctrl: #898781;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+main { max-width: 1500px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 20px; margin: 0 0 6px; }
+h2 { font-size: 15px; margin: 0 0 6px; }
+h3 { font-size: 13px; margin: 0 0 4px; color: var(--ink2); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin: 12px 0; }
+.meta { color: var(--ink2); font-size: 13px; display: flex; flex-wrap: wrap; gap: 2px 20px; }
+.meta b { color: var(--ink); font-weight: 600; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.sub { color: var(--ink2); font-size: 12px; margin: 0 0 6px; }
+.info { color: var(--muted); font-weight: 400; font-size: 12px; }
+ul.flags { margin: 6px 0 0; padding-left: 18px; }
+ul.flags li { margin: 2px 0; }
+details { margin-top: 8px; font-size: 13px; }
+details summary { cursor: pointer; color: var(--ink2); }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 5px; border: 1px solid;
+  border-radius: 4px; padding: 0 7px; font-size: 12px; font-weight: 600;
+  line-height: 20px; white-space: nowrap;
+}
+.badge::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--sw); }
+.b-PASS  { color: #0a6e0a; border-color: var(--pass);  background: #eef8ee; --sw: var(--pass); }
+.b-CHECK { color: #7a5000; border-color: var(--check); background: #fff7e3; --sw: var(--check); }
+.b-FAIL  { color: #a32626; border-color: var(--fail);  background: #fcefef; --sw: var(--fail); }
+.b-CTRL  { color: #52514e; border-color: var(--ctrl);  background: #f3f3f0; --sw: var(--ctrl); }
+.b-NA, .b-INFO { color: var(--ink2); border-color: var(--line2); background: transparent; --sw: var(--line2); }
+
+.bar { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.bar label { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--ink2); }
+.bar select, .bar input[type=search] {
+  font: inherit; font-size: 13px; padding: 3px 6px; border: 1px solid var(--line2);
+  border-radius: 4px; background: #fff; color: var(--ink);
+}
+.bar input[type=search] { width: 14em; }
+.bar fieldset { border: 0; margin: 0; padding: 0; display: inline-flex; gap: 10px; align-items: center; }
+.bar legend { float: left; padding: 0 6px 0 0; font-size: 13px; color: var(--ink2); }
+#f-count { color: var(--muted); font-size: 12px; margin-left: auto; }
+
+.maps-head { display: flex; gap: 16px; }
+.maps-scroll { max-height: 75vh; overflow-y: auto; overflow-x: hidden; border-top: 1px solid var(--line); }
+.maps { display: flex; gap: 16px; }
+.map-len { flex: 2.3 1 0; min-width: 0; }
+.map-q { flex: 1 1 0; min-width: 0; }
+.maps canvas { display: block; cursor: pointer; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; font-size: 12px; color: var(--ink2); margin-top: 8px; }
+.ramp { display: inline-block; width: 110px; height: 10px; border: 1px solid var(--line2); vertical-align: middle; }
+.sw { display: inline-block; width: 12px; height: 10px; border: 1px solid var(--line2); vertical-align: middle; }
+
+.detail h2 { font-size: 17px; margin: 0; }
+.d-head { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+.d-head .meta { flex: 1 1 auto; }
+.d-head button {
+  font: inherit; font-size: 12px; border: 1px solid var(--line2); background: #fff;
+  border-radius: 4px; padding: 2px 10px; cursor: pointer; color: var(--ink);
+}
+.d-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-top: 10px; }
+.d-plot canvas { display: block; width: 100%; }
+table.m { border-collapse: collapse; width: 100%; font-size: 13px; }
+table.m th, table.m td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.m th { color: var(--ink2); font-weight: 600; }
+table.m td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.m td.thr { color: var(--ink2); font-size: 12px; }
+
+.tablewrap { overflow-x: auto; }
+table.t { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+table.t th, table.t td { padding: 4px 7px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+table.t td.wrap { white-space: normal; min-width: 14em; }
+table.t td.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.t th { position: sticky; top: 0; background: var(--panel); z-index: 1; padding: 0; }
+table.t th button {
+  font: inherit; font-weight: 600; color: var(--ink2); background: none; border: 0;
+  padding: 6px 7px; cursor: pointer; width: 100%; text-align: inherit; white-space: nowrap;
+}
+table.t th[aria-sort] button { color: var(--ink); }
+table.t tbody tr { cursor: pointer; }
+table.t tbody tr:hover { background: #f5f4ef; }
+table.t tbody tr:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+table.t tbody tr.sel { background: #e8f1fc; }
+td.lv1 { background: #fff7e3; }
+td.lv2 { background: #fcefef; }
+.mk { font-size: 10.5px; font-weight: 600; margin-left: 4px; text-transform: uppercase; }
+td.lv1 .mk { color: #7a5000; }
+td.lv2 .mk { color: #a32626; }
+.na { color: var(--muted); }
+
+.tip {
+  position: fixed; z-index: 10; pointer-events: none; max-width: 360px;
+  background: var(--panel); border: 1px solid var(--line2); border-radius: 5px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.12); padding: 6px 8px; font-size: 12px;
+}
+.tip .t-id { font-weight: 600; }
+.tip .t-sub { color: var(--ink2); }
+footer { color: var(--muted); font-size: 12px; margin: 18px 0 8px; }
+
+@media (max-width: 900px) {
+  .maps, .maps-head { flex-direction: column; }
+  .maps-head .map-q { display: none; }
+  .map-q .q-title { display: block; }
+  #f-count { margin-left: 0; }
+}
+.q-title { display: none; margin-top: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <header class="panel" id="hdr"></header>
+
+  <section class="panel">
+    <div class="bar" id="bar">
+      <label>Client <select id="f-client"></select></label>
+      <fieldset id="f-flags"><legend>Flag</legend></fieldset>
+      <label>Sort <select id="f-sort"></select></label>
+      <label>Search <input id="f-search" type="search" placeholder="sample name" autocomplete="off"></label>
+      <span id="f-count" aria-live="polite"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="maps-head">
+      <div class="map-len">
+        <h2>Read length</h2>
+        <p class="sub" id="sub-len"></p>
+      </div>
+      <div class="map-q">
+        <h2>Mean read Q <span class="info">informational, not flagged</span></h2>
+        <p class="sub" id="sub-q"></p>
+      </div>
+    </div>
+    <div class="maps-scroll">
+      <div class="maps">
+        <div class="map-len"><canvas id="hm-len" role="img" aria-label="Read length heatmap, one row per sample"></canvas></div>
+        <div class="map-q">
+          <div class="q-title"><h2>Mean read Q <span class="info">informational, not flagged</span></h2></div>
+          <canvas id="hm-q" role="img" aria-label="Mean read Q heatmap, one row per sample"></canvas>
+        </div>
+      </div>
+    </div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <section class="panel detail" id="detail" hidden></section>
+
+  <section class="panel">
+    <h2>All samples</h2>
+    <p class="sub">Click a column to sort, click a row (or press Enter) to open its drill-down.</p>
+    <div class="tablewrap"><table class="t" id="tbl"><thead></thead><tbody></tbody></table></div>
+  </section>
+
+  <footer id="foot"></footer>
+</main>
+<div class="tip" id="tip" hidden></div>
+
+<script id="qc-data" type="application/json">__QC_DATA__</script>
+<script>
+(function () {
+"use strict";
+
+const D = JSON.parse(document.getElementById("qc-data").textContent);
+const S = D.samples;
+const M = D.metrics;                                    // flagged metrics
+const MBY = Object.fromEntries(M.map(m => [m.key, m]));
+
+const FLAGS = ["FAIL", "CHECK", "PASS", "CTRL"];
+const FLAG_RANK = { FAIL: 0, CHECK: 1, PASS: 2, CTRL: 3 };
+const FLAG_COLOUR = { PASS: "#0ca30c", CHECK: "#fab219", FAIL: "#d03b3b", CTRL: "#898781" };
+const LEVEL = ["PASS", "CHECK", "FAIL"];
+const SEQ = ["#fcfcfb", "#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"];
+const EMPTY = "#e1e0d9", INK = "#0b0b0b", INK2 = "#52514e", MUTED = "#898781",
+      GUIDE = "#d03b3b", LINE = "#c3c2b7", GRID = "#e1e0d9";
+const coll = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+// ---- helpers -------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const esc = v => String(v == null ? "" : v).replace(/[&<>"']/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const sum = a => a.reduce((t, v) => t + v, 0);
+const int = v => Math.round(v).toLocaleString("en-US");
+const badge = (flag, text) => `<span class="badge b-${flag}">${esc(text || flag)}</span>`;
+
+const SEQ_RGB = SEQ.map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
+function ramp(t) {
+  t = Math.max(0, Math.min(1, t));
+  const p = t * (SEQ_RGB.length - 1);
+  const i = Math.min(SEQ_RGB.length - 2, Math.floor(p)), f = p - i;
+  const a = SEQ_RGB[i], b = SEQ_RGB[i + 1];
+  return `rgb(${a.map((v, k) => Math.round(v + (b[k] - v) * f)).join(",")})`;
+}
+
+function fmtMetric(key, v) {
+  if (v == null) return null;
+  if (key === "delivered_reads") return int(v);
+  if (key === "modal_dev_bp") return `${Math.round(v)} bp`;
+  if (key === "median_q") return `Q${v}`;
+  return `${(100 * v).toFixed(1)}%`;
+}
+function fmtThr(key, v) {
+  if (key === "delivered_reads") return int(v);
+  if (key === "modal_dev_bp") return `${v} bp`;
+  return `${+(100 * v).toFixed(1)}%`;
+}
+function thresholdText(m) {
+  const lt = m.direction === "higher_better" ? "<" : ">";
+  const abs = `Check ${lt} ${fmtThr(m.key, m.check)}, Fail ${lt} ${fmtThr(m.key, m.fail)}`;
+  if (!m.relative) return abs;
+  return `Relative to run median ${fmtMetric(m.key, m.median)}: Check at z ≥ ${D.run.k_check}, ` +
+         `Fail at z ≥ ${D.run.k_fail} (run median is at ${LEVEL[m.run_level]})`;
+}
+
+// Fractions per bin, and a shared colour scale per heatmap.
+for (const s of S) {
+  const lt = sum(s.len), qt = sum(s.q);
+  s.lenN = lt; s.qN = qt;
+  s.lenF = lt ? s.len.map(c => c / lt) : null;
+  s.qF = qt ? s.q.map(c => c / qt) : null;
+}
+const VMAX = {};
+for (const k of ["len", "q"]) {
+  let mx = 0;
+  for (const s of S) { const F = s[k + "F"]; if (F) for (const v of F) if (v > mx) mx = v; }
+  VMAX[k] = Math.max(0.05, mx);
+}
+const BY_ID = Object.fromEntries(S.map(s => [s.id, s]));
+
+function binLabel(kind, b) {
+  const a = D.axes[kind];
+  const lo = a.min + b * a.step;
+  if (kind === "len") {
+    if (b === 0) return `< ${int(a.min + a.step)} bp`;
+    if (b === a.n - 1) return `≥ ${int(lo)} bp`;
+    return `${int(lo)}–${int(lo + a.step - 1)} bp`;
+  }
+  if (b === 0) return `Q ≤ ${lo}`;
+  if (b === a.n - 1) return `Q ≥ ${lo}`;
+  return `Q${lo}`;
+}
+
+// ---- table columns / sorting ---------------------------------------------
+const COLS = [
+  { key: "flag", label: "Flag", type: "flag" },
+  { key: "client", label: "Client", type: "str" },
+  { key: "id", label: "Sample", type: "str" },
+  { key: "barcode", label: "Barcode", type: "str" },
+  { key: "location", label: "Location", type: "str" },
+  { key: "type", label: "Type", type: "str" },
+  { key: "raw", label: "Raw demuxed", type: "num" },
+  { key: "delivered_reads", label: "Delivered", type: "metric" },
+  { key: "primer_found", label: "Primer found", type: "metric" },
+  { key: "long_frac", label: "Long (> 2 kb)", type: "metric" },
+  { key: "core_frac", label: "Core window", type: "metric" },
+  { key: "modal_length", label: "Modal length", type: "num" },
+  { key: "modal_dev_bp", label: "Modal dev", type: "metric" },
+  { key: "median_q", label: "Median Q (info)", type: "info" },
+  { key: "reasons", label: "Reasons", type: "str" },
+  { key: "comment", label: "Comment", type: "str" },
+];
+const COL = Object.fromEntries(COLS.map(c => [c.key, c]));
+
+function getVal(s, c) {
+  if (c.type === "metric" || c.type === "info") return s.values[c.key];
+  const v = s[c.key];
+  return v === "" ? null : v;
+}
+function defaultDir(key) {
+  const m = MBY[key];
+  if (m) return m.direction === "higher_better" ? 1 : -1;   // worst first
+  return 1;
+}
+function byFlag(a, b) {
+  return FLAG_RANK[a.flag] - FLAG_RANK[b.flag] || coll.compare(a.barcode, b.barcode) || a.order - b.order;
+}
+function comparator(key, dir) {
+  if (key === "flag") return (a, b) => dir * byFlag(a, b);
+  const c = COL[key];
+  return (a, b) => {
+    const va = getVal(a, c), vb = getVal(b, c);
+    if (va == null && vb == null) return byFlag(a, b);
+    if (va == null) return 1;                                // NA always last
+    if (vb == null) return -1;
+    const d = typeof va === "number" ? va - vb : coll.compare(String(va), String(vb));
+    return dir * d || byFlag(a, b);
+  };
+}
+
+// ---- state -----------------------------------------------------------------
+const state = { client: "", flags: new Set(FLAGS), sort: "flag", dir: 1, q: "", sel: null };
+
+function visible() {
+  const q = state.q.trim().toLowerCase();
+  return S.filter(s => (!state.client || s.client === state.client)
+                    && state.flags.has(s.flag)
+                    && (!q || s.id.toLowerCase().includes(q)))
+          .sort(comparator(state.sort, state.dir));
+}
+
+// ---- header ----------------------------------------------------------------
+function renderHeader() {
+  const r = D.run;
+  const counts = FLAGS.map(f => badge(f, `${f} ${r.flag_counts[f] || 0}`)).join(" ");
+  const flags = r.run_flags.length
+    ? `<ul class="flags">${r.run_flags.map(l => `<li>${esc(l)}</li>`).join("")}</ul>`
+    : `<p class="sub" style="margin-top:6px">No run-level flags.</p>`;
+  const catchAll = r.catch_all.map(c => `${esc(c.sample)} ${int(c.reads)} reads (${c.share.toFixed(1)}%)`).join(" · ");
+  const warn = r.warnings.length
+    ? `<details><summary>${r.warnings.length} warning(s)</summary><ul class="flags">${r.warnings.map(w => `<li>${esc(w)}</li>`).join("")}</ul></details>`
+    : "";
+  const pre = r.filter_stage === "pre"
+    ? `<p class="sub" style="margin-top:8px"><b>Pre-mode run:</b> Chopper ran before demultiplexing, so reads &gt; 2 kb were never demultiplexed; long_frac is NA for every sample and the length heatmap has no &gt; 2 kb tail.</p>`
+    : "";
+  $("hdr").innerHTML = `
+    <h1>16S QC report — ${esc(r.name)}</h1>
+    <div class="meta">
+      <span><b>Filter stage</b> ${esc(r.filter_stage_note)}</span>
+      <span><b>Config</b> ${esc(r.config_version)}</span>
+      <span><b>Generated</b> ${esc(r.generated)}</span>
+    </div>
+    <div class="meta"><span><b>Output dir</b> ${esc(r.output_dir)}</span></div>
+    <div class="row">${counts}</div>
+    <h3 style="margin-top:10px">Run-level flags</h3>${flags}
+    <p class="sub" style="margin-top:6px">Catch-all bins (share of all demultiplexed reads): ${catchAll || "none"}</p>
+    ${pre}${warn}`;
+  $("foot").innerHTML = `PASS / CHECK / FAIL is triage, not sign-off. ${esc(r.windows_note)} ` +
+    `Read quality is shown for information only and is never flagged. Generated by qc_report.py.`;
+}
+
+// ---- filter bar --------------------------------------------------------------
+function renderBar() {
+  const clients = [...new Set(S.map(s => s.client))].sort(coll.compare);
+  $("f-client").innerHTML = `<option value="">All clients (${clients.length})</option>` +
+    clients.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  $("f-client").onchange = e => { state.client = e.target.value; render(); };
+
+  $("f-flags").insertAdjacentHTML("beforeend", FLAGS.map(f =>
+    `<label><input type="checkbox" value="${f}" checked> ${badge(f)}</label>`).join(""));
+  $("f-flags").onchange = e => {
+    if (e.target.checked) state.flags.add(e.target.value); else state.flags.delete(e.target.value);
+    render();
+  };
+
+  $("f-sort").innerHTML = COLS.map(c =>
+    `<option value="${c.key}">${c.key === "flag" ? "Flag → barcode" : esc(c.label)}</option>`).join("");
+  $("f-sort").onchange = e => { state.sort = e.target.value; state.dir = defaultDir(state.sort); render(); };
+  $("f-search").oninput = e => { state.q = e.target.value; render(); };
+
+  const a = D.axes, cw = D.run.core_window;
+  $("sub-len").textContent = `Row-normalised fraction of each sample's reads, ${a.len.step} bp bins` +
+    ` (end bins hold < ${int(a.len.min + a.len.step)} / ≥ ${int(a.len.max)} bp). Shaded = core window ` +
+    `${int(cw.min)}–${int(cw.max)} bp; dashed = ${int(D.run.delivered.min)} / ${int(D.run.delivered.max)} bp.`;
+  $("sub-q").textContent = `Mean read Q of reads in ${int(D.run.delivered.min)}–${int(D.run.delivered.max)} bp,` +
+    ` integer bins (end bins clamped). For information only.`;
+  const rampCss = `linear-gradient(to right, ${SEQ.join(",")})`;
+  $("legend").innerHTML =
+    FLAGS.map(f => badge(f)).join(" ") +
+    `<span><span class="sw" style="background:${EMPTY}"></span> no data</span>` +
+    `<span>Length: 0 <span class="ramp" style="background:${rampCss}"></span> ≥ ${(100 * VMAX.len).toFixed(0)}%</span>` +
+    `<span>Q: 0 <span class="ramp" style="background:${rampCss}"></span> ≥ ${(100 * VMAX.q).toFixed(0)}%</span>` +
+    `<span>Hover a row for details, click it to drill down.</span>`;
+}
+
+// ---- heatmaps ----------------------------------------------------------------
+function rowHeight(n) {
+  if (n <= 96) return 14;
+  return Math.max(3, Math.min(10, Math.floor(1200 / n)));
+}
+function setupCanvas(cv, W, H) {
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  cv.style.width = W + "px"; cv.style.height = H + "px";
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  return g;
+}
+function lenGuides(g, xOf, y0, y1) {
+  const cw = D.run.core_window;
+  g.fillStyle = "rgba(11,11,11,0.06)";
+  g.fillRect(xOf(cw.min), y0, xOf(cw.max) - xOf(cw.min), y1 - y0);
+  g.save();
+  g.strokeStyle = GUIDE; g.lineWidth = 1.2; g.setLineDash([4, 3]);
+  for (const bp of [D.run.delivered.min, D.run.delivered.max]) {
+    const x = Math.round(xOf(bp)) + 0.5;
+    g.beginPath(); g.moveTo(x, y0); g.lineTo(x, y1); g.stroke();
+  }
+  g.restore();
+}
+function xTicks(kind) {
+  const a = D.axes[kind], out = [];
+  const every = kind === "len" ? 500 : 5;
+  for (let v = a.min; v <= a.max; v += every) out.push(v);
+  return out;
+}
+
+function drawMap(cv, kind, rows) {
+  const W = cv.parentElement.clientWidth;
+  const n = rows.length, rowH = rowHeight(n), top = 26, bottom = 6;
+  const H = top + Math.max(n, 1) * rowH + bottom;
+  const g = setupCanvas(cv, W, H);
+  const a = D.axes[kind];
+  const gutter = kind === "len" ? Math.min(150, Math.round(W * 0.28)) : 0;
+  const stripW = 10, x0 = gutter + stripW + 4, x1 = W - 6, pw = x1 - x0, cw = pw / a.n;
+  const xOf = v => x0 + (v - a.min) / a.step * cw;
+  cv._geo = { kind, rows, rowH, top, x0, cw, n: a.n };
+
+  // x axis, on top so it stays in view while scrolling
+  g.font = "11px system-ui, sans-serif"; g.fillStyle = MUTED; g.strokeStyle = LINE;
+  g.textAlign = "center"; g.textBaseline = "alphabetic";
+  for (const v of xTicks(kind)) {
+    const x = Math.round(xOf(v)) + 0.5;
+    g.beginPath(); g.moveTo(x, top - 5); g.lineTo(x, top - 1); g.stroke();
+    g.fillText(kind === "len" ? int(v) : `Q${v}`, Math.min(Math.max(x, x0 + 14), x1 - 14), top - 9);
+  }
+  if (!n) {
+    g.fillStyle = MUTED; g.textAlign = "left";
+    g.fillText("No samples match the filters.", x0, top + 12);
+    return;
+  }
+
+  const labelAll = n <= 96;
+  let lastY = -1e9;
+  g.textAlign = "right"; g.textBaseline = "middle";
+  g.font = `${rowH >= 12 ? 11 : 10}px system-ui, sans-serif`;
+  rows.forEach((s, i) => {
+    const y = top + i * rowH;
+    g.fillStyle = FLAG_COLOUR[s.flag];
+    g.fillRect(gutter, y, stripW, rowH > 5 ? rowH - 1 : rowH);
+    const F = s[kind + "F"];
+    if (!F) {
+      g.fillStyle = EMPTY; g.fillRect(x0, y, pw, rowH);
+    } else {
+      for (let b = 0; b < a.n; b++) {
+        const xa = Math.floor(x0 + b * cw), xb = Math.floor(x0 + (b + 1) * cw);
+        g.fillStyle = ramp(F[b] / VMAX[kind]);
+        g.fillRect(xa, y, xb - xa, rowH);
+      }
+    }
+    if (gutter && (labelAll || s.flag === "CHECK" || s.flag === "FAIL")) {
+      const yc = y + rowH / 2;
+      if (yc - lastY >= 11) {
+        let t = s.id;
+        while (t.length > 4 && g.measureText(t).width > gutter - 8) t = t.slice(0, -2);
+        if (t !== s.id) t = t.slice(0, -1) + "…";
+        g.fillStyle = INK; g.fillText(t, gutter - 4, yc);
+        lastY = yc;
+      }
+    }
+  });
+  const yEnd = top + n * rowH;
+  if (kind === "len") lenGuides(g, xOf, top, yEnd);
+  g.strokeStyle = LINE; g.lineWidth = 1;
+  g.strokeRect(x0 + 0.5, top + 0.5, pw - 1, yEnd - top - 1);
+
+  const si = rows.findIndex(s => s.id === state.sel);
+  if (si >= 0) {
+    g.strokeStyle = INK; g.lineWidth = 2;
+    g.strokeRect(gutter + 1, top + si * rowH - 1, x1 - gutter - 1, rowH + 2);
+  }
+}
+
+function hitTest(cv, ev) {
+  const geo = cv._geo;
+  if (!geo) return null;
+  const r = cv.getBoundingClientRect();
+  const x = ev.clientX - r.left, y = ev.clientY - r.top;
+  const i = Math.floor((y - geo.top) / geo.rowH);
+  if (i < 0 || i >= geo.rows.length) return null;
+  const b = Math.floor((x - geo.x0) / geo.cw);
+  return { s: geo.rows[i], b: b >= 0 && b < geo.n ? b : null, kind: geo.kind };
+}
+
+const tip = $("tip");
+function showTip(ev, h) {
+  const s = h.s;
+  let bin = "";
+  if (h.b != null) {
+    const F = s[h.kind + "F"];
+    bin = `<div class="t-sub">${esc(binLabel(h.kind, h.b))}: ${F ? (100 * F[h.b]).toFixed(1) + "% of reads" : "no data"}</div>`;
+  }
+  tip.innerHTML = `<div class="t-id">${esc(s.id)}</div>
+    <div class="t-sub">${esc(s.client)}${s.barcode ? " · " + esc(s.barcode) : ""} · n = ${int(s.n)}</div>
+    <div style="margin:3px 0">${badge(s.flag)} ${esc(s.reasons)}</div>${bin}`;
+  tip.hidden = false;
+  const pad = 14, tw = tip.offsetWidth, th = tip.offsetHeight;
+  let x = ev.clientX + pad, y = ev.clientY + pad;
+  if (x + tw > window.innerWidth - 4) x = ev.clientX - tw - pad;
+  if (y + th > window.innerHeight - 4) y = ev.clientY - th - pad;
+  tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px";
+}
+for (const id of ["hm-len", "hm-q"]) {
+  const cv = $(id);
+  cv.addEventListener("mousemove", ev => { const h = hitTest(cv, ev); if (h) showTip(ev, h); else tip.hidden = true; });
+  cv.addEventListener("mouseleave", () => { tip.hidden = true; });
+  cv.addEventListener("click", ev => { const h = hitTest(cv, ev); if (h) select(h.s.id, true); });
+}
+
+// ---- drill-down ----------------------------------------------------------------
+function drawHist(cv, kind, s) {
+  const W = cv.parentElement.clientWidth, H = 210;
+  const g = setupCanvas(cv, W, H);
+  const a = D.axes[kind];
+  const L = 44, R = 8, T = 10, B = 26, pw = W - L - R, ph = H - T - B, cw = pw / a.n;
+  const xOf = v => L + (v - a.min) / a.step * cw;
+  const F = s[kind + "F"], med = D.run_median[kind];
+  g.font = "11px system-ui, sans-serif";
+  if (!F) {
+    g.fillStyle = MUTED; g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillText("no data", L + pw / 2, T + ph / 2);
+    return;
+  }
+  // Four gridlines at a round step that covers the tallest bar / median.
+  const peak = Math.max(...F, ...(med || [0]));
+  const tick = [0.0025, 0.005, 0.01, 0.02, 0.025, 0.05, 0.1, 0.2, 0.25].find(t => 4 * t >= peak) || 0.25;
+  const ymax = 4 * tick;
+  const yOf = v => T + ph - v / ymax * ph;
+
+  g.textAlign = "right"; g.textBaseline = "middle";
+  for (let k = 0; k <= 4; k++) {
+    const v = tick * k, y = Math.round(yOf(v)) + 0.5;
+    g.strokeStyle = GRID; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke();
+    g.fillStyle = MUTED; g.fillText(`${+(100 * v).toFixed(2)}%`, L - 5, y);
+  }
+  if (kind === "len") lenGuides(g, xOf, T, T + ph);
+
+  g.fillStyle = FLAG_COLOUR[s.flag];
+  for (let b = 0; b < a.n; b++) {
+    if (!F[b]) continue;
+    const xa = L + b * cw, y = yOf(F[b]);
+    g.fillRect(xa + (cw > 4 ? 0.5 : 0), y, Math.max(1, cw - (cw > 4 ? 1 : 0)), T + ph - y);
+  }
+  if (med) {
+    g.strokeStyle = INK2; g.lineWidth = 1.5; g.beginPath();
+    med.forEach((v, b) => {
+      const y = yOf(v), xa = L + b * cw;
+      if (b === 0) g.moveTo(xa, y); else g.lineTo(xa, y);
+      g.lineTo(xa + cw, y);
+    });
+    g.stroke();
+  }
+  g.strokeStyle = LINE; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(L, T + ph + 0.5); g.lineTo(L + pw, T + ph + 0.5); g.stroke();
+  g.fillStyle = MUTED; g.textAlign = "center"; g.textBaseline = "top";
+  for (const v of xTicks(kind)) {
+    const x = xOf(v);
+    g.fillText(kind === "len" ? int(v) : `Q${v}`, Math.min(Math.max(x, L + 14), L + pw - 14), T + ph + 6);
+  }
+}
+
+function metricRows(s) {
+  const out = M.map(m => {
+    const v = s.values[m.key];
+    const txt = v == null ? `<span class="na">${esc(s.na[m.key] || "NA")}</span>` : esc(fmtMetric(m.key, v));
+    const z = s.z[m.key] != null ? ` <span class="info">(z = ${s.z[m.key].toFixed(1)})</span>` : "";
+    const lv = s.levels[m.key];
+    const st = lv == null ? badge("NA") : badge(LEVEL[lv]);
+    return `<tr><td>${esc(m.label)}</td><td class="num">${txt}${z}</td><td>${st}</td><td class="thr">${esc(thresholdText(m))}</td></tr>`;
+  });
+  const q = s.values.median_q;
+  out.push(`<tr><td>Median read Q</td><td class="num">${q == null ? `<span class="na">${esc(s.na.median_q || "NA")}</span>` : esc(fmtMetric("median_q", q))}</td>` +
+           `<td>${badge("INFO", "info")}</td><td class="thr">Informational only — read quality is not flagged</td></tr>`);
+  return out.join("");
+}
+
+function renderDetail(s) {
+  const el = $("detail");
+  const where = [s.client, s.barcode && `barcode ${s.barcode}`, s.location && `well ${s.location}`, s.type]
+    .filter(Boolean).map(esc).join(" · ");
+  const ctrl = s.flag === "CTRL"
+    ? `<p class="sub">Control sample: metrics are reported but not flagged, and it is left out of every run median.</p>` : "";
+  el.innerHTML = `
+    <div class="d-head">
+      <h2>${esc(s.id)}</h2> ${badge(s.flag)}
+      <div class="meta"><span>${where}</span>
+        <span><b>Raw demuxed</b> ${s.raw == null ? "–" : int(s.raw)}</span>
+        <span><b>Delivered</b> ${s.values.delivered_reads == null ? "–" : int(s.values.delivered_reads)}</span>
+        <span><b>Modal length</b> ${s.modal_length == null ? "–" : int(s.modal_length) + " bp"}</span></div>
+      <button type="button" id="d-close">Close</button>
+    </div>
+    ${ctrl}
+    <div class="d-grid">
+      <div class="d-plot"><h3>Read length</h3><canvas id="dh-len" role="img" aria-label="Read length histogram for ${esc(s.id)}"></canvas>
+        <p class="sub">Bars: this sample (${int(s.lenN)} reads), coloured by flag. Grey line: per-bin run median of real samples. Shaded = core window; dashed = delivered window.</p></div>
+      <div class="d-plot"><h3>Mean read Q <span class="info">informational</span></h3><canvas id="dh-q" role="img" aria-label="Mean read Q histogram for ${esc(s.id)}"></canvas>
+        <p class="sub">Reads in the delivered window (${int(s.qN)}). Grey line: run median. Not flagged.</p></div>
+    </div>
+    <table class="m" style="margin-top:10px">
+      <thead><tr><th>Metric</th><th>Value</th><th>Status</th><th>Threshold</th></tr></thead>
+      <tbody>${metricRows(s)}</tbody>
+    </table>
+    <p style="margin:10px 0 2px"><b>Reasons:</b> ${s.reasons ? esc(s.reasons) : '<span class="na">none</span>'}</p>
+    <p style="margin:2px 0"><b>Comment:</b> ${s.comment ? esc(s.comment) : '<span class="na">none</span>'}</p>`;
+  el.hidden = false;
+  $("d-close").onclick = () => { state.sel = null; el.hidden = true; render(); };
+  drawHist($("dh-len"), "len", s);
+  drawHist($("dh-q"), "q", s);
+}
+
+function select(id, scroll) {
+  state.sel = id;
+  renderDetail(BY_ID[id]);
+  render();
+  if (scroll) $("detail").scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+// ---- table -----------------------------------------------------------------------
+function renderTableHead() {
+  $("tbl").tHead.innerHTML = "<tr>" + COLS.map(c => {
+    const on = c.key === state.sort;
+    const aria = on ? ` aria-sort="${state.dir > 0 ? "ascending" : "descending"}"` : "";
+    const arrow = on ? (state.dir > 0 ? " ▲" : " ▼") : "";
+    const right = ["num", "metric", "info"].includes(c.type) ? ' style="text-align:right"' : "";
+    return `<th${aria}${right}><button type="button" data-k="${c.key}">${esc(c.label)}${arrow}</button></th>`;
+  }).join("") + "</tr>";
+}
+$("tbl").tHead.addEventListener("click", e => {
+  const b = e.target.closest("button[data-k]");
+  if (!b) return;
+  const k = b.dataset.k;
+  if (k === state.sort) state.dir = -state.dir;
+  else { state.sort = k; state.dir = defaultDir(k); }
+  $("f-sort").value = state.sort;
+  render();
+});
+
+function cell(s, c) {
+  const v = getVal(s, c);
+  if (c.type === "flag") return `<td>${badge(s.flag)}</td>`;
+  if (c.type === "metric" || c.type === "info") {
+    if (v == null) return `<td class="num na">${esc(s.na[c.key] || "NA")}</td>`;
+    const lv = c.type === "metric" ? s.levels[c.key] || 0 : 0;
+    const mk = lv && s.flag !== "CTRL" ? `<span class="mk">${LEVEL[lv].toLowerCase()}</span>` : "";
+    return `<td class="num${lv && s.flag !== "CTRL" ? " lv" + lv : ""}">${esc(fmtMetric(c.key, v))}${mk}</td>`;
+  }
+  if (c.type === "num") return `<td class="num">${v == null ? "" : int(v)}</td>`;
+  const wrap = c.key === "reasons" || c.key === "comment" ? ' class="wrap"' : "";
+  return `<td${wrap}>${esc(v)}</td>`;
+}
+function renderTable(rows) {
+  renderTableHead();
+  $("tbl").tBodies[0].innerHTML = rows.map(s =>
+    `<tr tabindex="0" data-id="${esc(s.id)}"${s.id === state.sel ? ' class="sel"' : ""}>${COLS.map(c => cell(s, c)).join("")}</tr>`
+  ).join("");
+}
+const tbody = $("tbl").tBodies[0];
+tbody.addEventListener("click", e => { const tr = e.target.closest("tr[data-id]"); if (tr) select(tr.dataset.id, true); });
+tbody.addEventListener("keydown", e => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const tr = e.target.closest("tr[data-id]");
+  if (tr) { e.preventDefault(); select(tr.dataset.id, true); }
+});
+
+// ---- render loop -------------------------------------------------------------------
+function render() {
+  const rows = visible();
+  $("f-count").textContent = `${rows.length} of ${S.length} samples shown`;
+  drawMap($("hm-len"), "len", rows);
+  drawMap($("hm-q"), "q", rows);
+  renderTable(rows);
+}
+
+let resizeT = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => {
+    render();
+    if (state.sel) { drawHist($("dh-len"), "len", BY_ID[state.sel]); drawHist($("dh-q"), "q", BY_ID[state.sel]); }
+  }, 120);
+});
+
+renderHeader();
+renderBar();
+render();
+})();
+</script>
+</body>
+</html>
