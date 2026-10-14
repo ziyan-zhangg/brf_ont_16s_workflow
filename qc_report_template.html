@@ -267,7 +267,7 @@ const COLS = [
   { key: "id", label: "Sample", type: "str" },
   { key: "barcode", label: "Barcode", type: "str" },
   { key: "location", label: "Location", type: "str" },
-  { key: "type", label: "Type", type: "str" },
+  { key: "comment", label: "Comment", type: "str" },
   { key: "raw", label: "Raw demuxed", type: "num" },
   { key: "delivered_reads", label: "Delivered", type: "metric" },
   { key: "primer_found", label: "Primer found", type: "metric" },
@@ -277,7 +277,6 @@ const COLS = [
   { key: "modal_dev_bp", label: "Modal dev", type: "metric" },
   { key: "median_q", label: "Median Q (info)", type: "info" },
   { key: "reasons", label: "Reasons", type: "str" },
-  { key: "comment", label: "Comment", type: "str" },
 ];
 const COL = Object.fromEntries(COLS.map(c => [c.key, c]));
 
@@ -339,7 +338,6 @@ function renderHeader() {
       <span><b>Config</b> ${esc(r.config_version)}</span>
       <span><b>Generated</b> ${esc(r.generated)}</span>
     </div>
-    <div class="meta"><span><b>Output dir</b> ${esc(r.output_dir)}</span></div>
     <div class="row">${counts}</div>
     <h3 style="margin-top:10px">Run-level flags</h3>${flags}
     <p class="sub" style="margin-top:6px">Catch-all bins (share of all demultiplexed reads): ${catchAll || "none"}</p>

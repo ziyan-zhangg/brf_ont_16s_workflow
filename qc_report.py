@@ -60,6 +60,7 @@ import gzip
 import hashlib
 import html
 import json
+import re
 import shutil
 import statistics
 import sys
@@ -877,6 +878,17 @@ def _run_median_profile(rows: list[list[int]]) -> list[float] | None:
     return [round(statistics.median(col), 6) for col in zip(*fracs)]
 
 
+# An absolute POSIX or Windows path, not a relative fragment like demux_qc/x.
+_ABS_PATH = re.compile(r"(?<![\w.])(?:[A-Za-z]:)?(?:[\\/][^\\/\s:;,()'\"]+)+[\\/]?")
+
+
+def _client_safe(text: str) -> str:
+    """Reduce every absolute path to its last component. qc_report.html may
+    be sent to clients, so it must not reveal facility paths (/g/data/...)."""
+    return _ABS_PATH.sub(
+        lambda m: re.split(r"[\\/]", m.group(0).rstrip("\\/"))[-1], text)
+
+
 def _json_num(v: float | None) -> float | int | None:
     if v is None:
         return None
@@ -929,8 +941,9 @@ def html_data(args: argparse.Namespace, cfg: dict[str, Any], ev: Evaluation,
     len_edges, q_edges = _edges("len"), _edges("q")
     return {
         "run": {
+            # Run name only: no output_dir or other facility paths, the
+            # page may be sent to clients.
             "name": args.output_dir.resolve().name,
-            "output_dir": str(args.output_dir),
             "generated": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
             "config_version": config_label(cfg),
             "filter_stage": ev.filter_stage,
@@ -938,7 +951,7 @@ def html_data(args: argparse.Namespace, cfg: dict[str, Any], ev: Evaluation,
             "flag_counts": {fl: sum(r.flag == fl for r in ev.results)
                             for fl in ("PASS", "CHECK", "FAIL", "CTRL")},
             "run_flags": run_flag_lines(ev.runs),
-            "warnings": list(warnings),
+            "warnings": [_client_safe(w) for w in warnings],
             "catch_all": catch_all,
             "core_window": {"min": cw["min"], "max": cw["max"]},
             "delivered": {"min": f["minknow_min_len"],

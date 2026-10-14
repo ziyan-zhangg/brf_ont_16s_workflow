@@ -133,8 +133,9 @@ def build_run(tmp: Path, name: str, stage: str, long_name=None) -> Path:
 
 
 def write_sheet(path: Path) -> None:
-    path.write_text("Client,Sample_ID,Location,Barcode,Sample_Type\n" + "".join(
-        f"ClientA,{s},A{i + 1},TBC{i + 1:03d},{'NTC' if s == 'NTC1' else ''}\n"
+    path.write_text("Client,Sample_ID,Location,Barcode,Sample_Type,Comment\n" + "".join(
+        f"ClientA,{s},A{i + 1},TBC{i + 1:03d},{'NTC' if s == 'NTC1' else ''},"
+        f"{'low DNA input' if s == 'Tiny' else ''}\n"
         for i, s in enumerate(SAMPLES)))
 
 
@@ -323,6 +324,35 @@ def main() -> int:
           and t3["BP_q"]["flag"] == "PASS",
           "old config with pct_q20: warning, not a crash, Q still not flagged",
           f"old config: rc={rc} BP_q={t3['BP_q']['flag']}")
+
+    # ---- 2d. qc_report.html is client-safe ---------------------------------
+    # A run under a path holding every facility marker, with an old config
+    # and a second counts file beside it so warnings carry absolute paths.
+    leak = build_run(tmp, "g/data/vz35/scratch/home/ONT_16S_LEAK", "post")
+    shutil.copy(leak / "run_log_20261013" / "read_counts_summary.txt", leak)
+    leak_cfg = leak / "old_config.yaml"
+    leak_cfg.write_text(old_cfg.read_text())
+    run_report(leak, sheet, config=leak_cfg)
+    lpage = (leak / "qc_report" / "qc_report.html").read_text(encoding="utf-8")
+    flat = lpage.replace("\\\\", "/").replace("\\", "/")
+    found = [s for s in ("/g/data", "/scratch", "/home", "vz35") if s in flat]
+    lblob = html_blob(leak / "qc_report" / "qc_report.html")
+    check(not found and "output_dir" not in lblob["run"]
+          and lblob["run"]["name"] == "ONT_16S_LEAK"
+          and any("old_config.yaml: metrics.pct_q20" in w
+                  for w in lblob["run"]["warnings"]),
+          "qc_report.html has no facility paths (/g/data, /scratch, /home, "
+          "vz35); run name kept, warnings cut to file names",
+          f"qc_report.html leaks {found}; run={lblob.get('run')}")
+    ls = {s["id"]: s for s in lblob["samples"]}
+    check(ls["Tiny"]["comment"] == "low DNA input" and ls["S01"]["comment"] == ""
+          and ls["NTC1"]["type"] == "NTC" and ls["NTC1"]["flag"] == "CTRL",
+          "qc_report.html data keeps Comment and Sample_Type (controls -> CTRL)",
+          f"comment/type: {ls['Tiny']} {ls['NTC1']}")
+    check('{ key: "comment", label: "Comment"' in lpage
+          and '{ key: "type", label: "Type"' not in lpage,
+          "sample table shows Comment instead of Type",
+          "sample table columns not as expected")
 
     # ---- 3. pre mode -------------------------------------------------------
     out_pre = build_run(tmp, "run_pre", "pre")
