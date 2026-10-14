@@ -1,0 +1,98 @@
+#!/bin/bash
+#PBS -N QC_report
+#PBS -P vz35
+#PBS -l wd
+#PBS -m e
+#PBS -M ziyan.zhang@anu.edu.au
+#PBS -l ncpus=1
+#PBS -l mem=4GB
+#PBS -l walltime=00:15:00
+#PBS -l storage=gdata/vz35
+#PBS -q normal
+
+#--------README---------------------------------------------------------------
+# Per-sample QC report (PASS / CHECK / FAIL) for a finished pipeline run.
+# Wraps qc_report.py; writes everything to <output_dir>/qc_report/.
+#
+# run_script.qsub already runs qc_report.py at the end of every job, so this
+# wrapper is only for re-running it: after changing qc_config.yaml, on a past
+# run, or if the in-job report failed. It reads small tables only
+# (demux_qc/ + read_counts_summary.txt) -- no FASTQ, Minibar or Chopper --
+# and takes seconds:
+#
+#   qsub -v output_dir=<run output dir> run_qc_report.qsub
+#
+# Or chain it after a pipeline job run with run_qc_report=0:
+#
+#   jid=$(qsub run_script.qsub)
+#   qsub -W depend=afterok:$jid -v output_dir=<run output dir> run_qc_report.qsub
+#
+# output_dir: run_script.qsub builds it from the date its job *starts*, so
+# pass the real dir with -v output_dir=... rather than relying on today's
+# date here; the job stops with an error if the dir does not exist.
+#
+# Main output: <output_dir>/qc_report/qc_report.html (self-contained; open it
+# from anywhere, no network needed). Add --png-drilldown to the qc_report.py
+# call below for per-sample PNGs of flagged samples.
+#
+# Python packages: PyYAML, and matplotlib for the static PNGs (the tables and
+# qc_report.html are written without it), from the shared venv in qc_python.
+# If the preflight below fails, (re)create the venv:
+#
+#   module load python3/3.12.1
+#   python3 -m venv /g/data/vz35/ONT_16s_workflow/tools/qc_env
+#   /g/data/vz35/ONT_16s_workflow/tools/qc_env/bin/pip install pyyaml matplotlib
+#
+# Test a dev copy without editing this script:
+#
+#   qsub -v output_dir=<run>,tools_dir=<dev checkout> run_qc_report.qsub
+#-----------------------------------------------------------------------------
+
+set -euo pipefail
+
+#--------Module---------------------------------------------------------------
+module load python3/3.12.1
+
+date_stamp=$(date +%Y%m%d)
+
+#--------Variables (edit per run, or override with qsub -v)-------------------
+# Same values as the run_script.qsub that produced the run.
+samplesheet=${samplesheet:-/g/data/vz35/ONT_16s_workflow/sample_sheet/16s_samplesheet.csv}
+output_dir=${output_dir:-/g/data/vz35/ONT_16s_workflow/minibar_output/ONT_16S_TBC_${date_stamp}}
+
+#--------DONT-CHANGE----------------------------------------------------------
+tools_dir=${tools_dir:-/g/data/vz35/ONT_16s_workflow/tools/brf_ont_16s_workflow/}
+qc_script=${tools_dir}/qc_report.py
+qc_config=${qc_config:-${tools_dir}/qc_config.yaml}
+qc_python=${qc_python:-/g/data/vz35/ONT_16s_workflow/tools/qc_env/bin/python3}
+
+if [[ ! -d "$output_dir" ]]; then
+    echo "ERROR: output_dir not found: ${output_dir}" >&2
+    echo "       pass the pipeline's run dir with  qsub -v output_dir=..." >&2
+    exit 1
+fi
+
+if [[ ! -x "$qc_python" ]]; then
+    echo "ERROR: QC venv python not found: ${qc_python}" >&2
+    echo "       see the 'Python packages' note at the top of this script" >&2
+    exit 1
+fi
+if ! "$qc_python" -c "import yaml" 2>/dev/null; then
+    echo "ERROR: PyYAML missing from ${qc_python}" >&2
+    exit 1
+fi
+if ! "$qc_python" -c "import matplotlib" 2>/dev/null; then
+    echo "WARNING: matplotlib missing from ${qc_python}; no PNG heatmaps (tables and qc_report.html still written)." >&2
+fi
+
+echo "========================================"
+echo " QC report: $(date)"
+echo " Output dir:  ${output_dir}"
+echo " Samplesheet: ${samplesheet}"
+echo " Config:      ${qc_config}"
+echo "========================================"
+
+"$qc_python" "$qc_script" \
+    --output-dir  "$output_dir" \
+    --samplesheet "$samplesheet" \
+    --config      "$qc_config"

@@ -18,12 +18,16 @@ For every sample_<SampleID>.fastq in the integrated demultiplexing directory
     * raw demuxed read count
     * length histogram in 50 bp bins, plus N50 and modal length
     * mean read Q (per-read mean error probability -> Phred, averaged)
+    * integer mean-read-Q histogram, for all reads and for the reads inside
+      [minlength, maxlength], and the median Q of the in-window reads
+      (for display only -- read quality is not flagged)
     * % of reads falling inside [minlength, maxlength]
 
 Outputs, all under <output_dir>/demux_qc/:
 
     <SampleID>.tsv            one row per 50 bp bin, scalar stats in a
                               '#'-prefixed header block (pandas: comment='#')
+    <SampleID>.q.tsv          one row per integer mean-read-Q bin
     demux_qc_summary.tsv      one row per sample, all scalar stats
 
 Note on --filter-stage pre: the reads reaching this step have already been
@@ -101,10 +105,19 @@ class SampleQC:
     # exact length -> count; the 50 bp histogram is derived from this so that
     # N50/median/mode stay exact without holding one int per read in memory.
     length_counts: dict[int, int] = field(default_factory=dict, repr=False)
+    # floor(mean read Q) -> count, over all reads and over in-window reads.
+    # Flooring keeps "bin >= 20" identical to "mean Q >= 20".
+    q_counts: dict[int, int] = field(default_factory=dict, repr=False)
+    q_counts_in_window: dict[int, int] = field(default_factory=dict, repr=False)
 
     @property
     def pct_in_window(self) -> float:
         return 100.0 * self.reads_in_window / self.reads if self.reads else 0.0
+
+    @property
+    def median_q(self) -> int | None:
+        """Median Q bin of the in-window reads; informational, not flagged."""
+        return median_q_bin(self.q_counts_in_window)
 
     def histogram(self) -> list[tuple[int, int]]:
         """(bin_start, count) for every 50 bp bin from the shortest to the
@@ -118,6 +131,25 @@ class SampleQC:
         lo = min(binned)
         hi = max(binned)
         return [(b, binned.get(b, 0)) for b in range(lo, hi + BIN_WIDTH, BIN_WIDTH)]
+
+
+def median_q_bin(q_counts: dict[int, int]) -> int | None:
+    """Lower median of a floor(mean read Q) histogram, i.e. the Q bin holding
+    read number ceil(n/2) in ascending order. None for an empty histogram."""
+    total = sum(q_counts.values())
+    if not total:
+        return None
+    rank = (total + 1) // 2
+    seen = 0
+    for q in sorted(q_counts):
+        seen += q_counts[q]
+        if seen >= rank:
+            return q
+    return None
+
+
+def _fmt_q(q: int | None) -> str:
+    return "NA" if q is None else str(q)
 
 
 def scan_fastq(
@@ -135,6 +167,8 @@ def scan_fastq(
     )
 
     lengths: dict[int, int] = {}
+    q_all: dict[int, int] = {}
+    q_win: dict[int, int] = {}
     q_sum = 0.0
     err_prob = _ERR_PROB.__getitem__
 
@@ -155,18 +189,27 @@ def scan_fastq(
             qc.reads += 1
             qc.total_bp += length
             lengths[length] = lengths.get(length, 0) + 1
-            if minlength <= length <= maxlength:
+            in_window = minlength <= length <= maxlength
+            if in_window:
                 qc.reads_in_window += 1
 
-            if qual:
-                mean_err = sum(map(err_prob, qual)) / len(qual)
-                # Phred caps at ~93; a perfect-quality read would divide by 0.
-                q_sum += -10.0 * math.log10(mean_err) if mean_err > 0 else 93.0
+            mean_err = sum(map(err_prob, qual)) / len(qual)
+            # Phred caps at ~93; a perfect-quality read would divide by 0.
+            q = -10.0 * math.log10(mean_err) if mean_err > 0 else 93.0
+            q_sum += q
+            # The epsilon absorbs float noise, so a uniform-Q20 read whose
+            # mean comes out as 19.9999999 still lands in bin 20.
+            qb = int(q + 1e-6)
+            q_all[qb] = q_all.get(qb, 0) + 1
+            if in_window:
+                q_win[qb] = q_win.get(qb, 0) + 1
 
     if qc.reads == 0:
         return qc
 
     qc.length_counts = lengths
+    qc.q_counts = q_all
+    qc.q_counts_in_window = q_win
     qc.min_length = min(lengths)
     qc.max_length = max(lengths)
     qc.mean_length = qc.total_bp / qc.reads
@@ -203,7 +246,7 @@ _SUMMARY_COLUMNS = [
     "sample", "category", "reads", "total_bp", "min_length", "max_length",
     "mean_length", "median_length", "n50", "modal_length", "modal_bin",
     "modal_bin_count", "mean_read_q", "window_min", "window_max",
-    "reads_in_window", "pct_in_window",
+    "reads_in_window", "pct_in_window", "median_q",
 ]
 
 
@@ -226,6 +269,7 @@ def _summary_row(qc: SampleQC) -> list[str]:
         str(qc.window_max),
         str(qc.reads_in_window),
         f"{qc.pct_in_window:.2f}",
+        _fmt_q(qc.median_q),
     ]
 
 
@@ -257,6 +301,7 @@ def write_sample_tsv(qc: SampleQC, dest: Path, filter_stage: str, source: Path) 
         f"# length_window\t{qc.window_min}-{qc.window_max}",
         f"# reads_in_window\t{qc.reads_in_window}",
         f"# pct_in_window\t{qc.pct_in_window:.2f}",
+        f"# median_q\t{_fmt_q(qc.median_q)}",
         "bin_start\tbin_end\tcount\tpct_of_reads\tcum_pct",
     ]
 
@@ -270,6 +315,30 @@ def write_sample_tsv(qc: SampleQC, dest: Path, filter_stage: str, source: Path) 
             f"{bin_start}\t{bin_start + BIN_WIDTH - 1}\t{count}\t{pct:.3f}\t{cum_pct:.3f}"
         )
 
+    dest.write_text("\n".join(lines) + "\n")
+
+
+def write_q_tsv(qc: SampleQC, dest: Path, filter_stage: str) -> None:
+    """Integer mean-read-Q histogram, every bin from the lowest to the highest
+    so the profile stays plottable. count_in_window covers only the reads
+    inside [window_min, window_max] -- the population that can be delivered."""
+    lines = [
+        f"# sample\t{qc.sample_id}",
+        f"# category\t{qc.category}",
+        f"# filter_stage\t{filter_stage}",
+        f"# generated\t{datetime.now():%Y-%m-%d %H:%M:%S}",
+        "# q_bin\tfloor(mean read Q); mean Q = Phred of the mean per-base "
+        "error probability",
+        f"# length_window\t{qc.window_min}-{qc.window_max}",
+        f"# reads\t{qc.reads}",
+        f"# reads_in_window\t{qc.reads_in_window}",
+        f"# median_q\t{_fmt_q(qc.median_q)}",
+        "q_bin\tcount_all\tcount_in_window",
+    ]
+    if qc.q_counts:
+        for q in range(min(qc.q_counts), max(qc.q_counts) + 1):
+            lines.append(f"{q}\t{qc.q_counts.get(q, 0)}\t"
+                         f"{qc.q_counts_in_window.get(q, 0)}")
     dest.write_text("\n".join(lines) + "\n")
 
 
@@ -322,17 +391,19 @@ def run_demux_qc(
         results[sid] = qc
 
         write_sample_tsv(qc, qc_dir / f"{sid}.tsv", filter_stage, fq)
+        write_q_tsv(qc, qc_dir / f"{sid}.q.tsv", filter_stage)
         log(
             f"  {sid:<30} reads={qc.reads:>9,}  N50={qc.n50:>6}  "
             f"mode={qc.modal_bin_start}-{qc.modal_bin_start + BIN_WIDTH - 1}  "
             f"meanQ={qc.mean_read_q:>5.2f}  "
-            f"in {minlength}-{maxlength}bp={qc.pct_in_window:>6.2f}%"
+            f"in {minlength}-{maxlength}bp={qc.pct_in_window:>6.2f}%  "
+            f"medianQ={_fmt_q(qc.median_q):>3}"
         )
 
     summary = qc_dir / "demux_qc_summary.tsv"
     write_summary_tsv(list(results.values()), summary)
     log("")
-    log(f" Per-sample TSVs: {qc_dir}/<SampleID>.tsv")
+    log(f" Per-sample TSVs: {qc_dir}/<SampleID>.tsv, <SampleID>.q.tsv")
     log(f" Run summary:     {summary}")
     log(f" Demux QC complete: {datetime.now():%Y-%m-%d %H:%M:%S}")
     log("========================================")

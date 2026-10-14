@@ -1,3 +1,13 @@
+v6.00
+Date: 2026-10-14
+* Change: filter_stage default is now post (demultiplex first, then Chopper per sample).
+* Add: per-sample QC report (qc_report.py, qc_config.yaml, run_qc_report.qsub):
+  Pass/Check/Fail flags on delivered reads, primer-found, >2 kb fraction,
+  core-amplicon fraction and modal length; interactive HTML report plus
+  client-safe per-client HTML reports. Runs at the end of run_script.qsub.
+* Update: demux_qc.py records a per-read Q histogram (display only).
+* Requires: shared venv /g/data/vz35/ONT_16s_workflow/tools/qc_env (PyYAML, matplotlib).
+
 v5.05
 Date: 2026-10-12
 * Fix: correctly handle empty fastq files. 
