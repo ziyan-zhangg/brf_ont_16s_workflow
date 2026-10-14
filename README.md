@@ -380,7 +380,9 @@ minibar_output/ONT_16S_TBC_<date>/
 
 **Read quality is not flagged.** Every delivered read already passed MinKNOW Q15, and Q20 is an unreasonable bar for ONT 16S. The Q distribution is still shown (heatmap and drill-down), and `median_q` is reported, for information only.
 
-The main output is **`qc_report/qc_report.html`**: a single self-contained page (no network access needed -- open it from Gadi, a shared drive or an email attachment) with the run summary, interactive length and Q heatmaps, a click-to-drill-down view per sample and a sortable table.
+The main output is **`qc_report/qc_report.html`**: a single self-contained page (no network access needed -- open it from Gadi, a shared drive or an email attachment) with the run summary, interactive length and Q heatmaps, a click-to-drill-down view per sample and a sortable table. `per_client/<Client>_qc_report.html` is the same page cut to one client, for sending to that client.
+
+**Client-safe HTML.** No HTML report contains internal paths or identifiers (no `/g/data`, `/scratch`, `/home`, `vz35`, usernames, sample-sheet or config paths); the config is identified by version and short hash, and paths in warnings are cut to file names. A per-client report contains nothing about other clients -- no sample IDs, barcodes, comments or client names, not even in the embedded data. Its header counts are recomputed for that client; run-level flags appear only as anonymous text (e.g. `RUN: LONG (median 18%, FAIL)`), the drill-down's run-median line is an anonymous aggregate, and warnings and catch-all bin counts are left out.
 
 It is a pure reader of `demux_qc/` and `read_counts_summary.txt`: no FASTQ access, no Minibar, no Chopper. It takes seconds and runs automatically at the end of `run_script.qsub` (`run_qc_report=1`). A QC failure there is reported but does not fail the job. To re-run it -- after changing thresholds, on a past run, or if the in-job report failed:
 
@@ -418,7 +420,8 @@ Per metric 0 = pass, 1 = check, 2 = fail; the sample's flag is the worst metric.
 - If a metric's **run median** is already at CHECK or worse, a run flag is raised (e.g. `RUN: LONG (median 18%, FAIL)`) and samples are judged on that metric **relative to the run**: robust z = (value − median) / max(1.4826 × MAD, `mad_floor`), CHECK at z ≥ 3, FAIL at z ≥ 5, in the bad direction only. One bad flowcell therefore raises one run flag instead of turning the whole table red. Fewer than `min_samples` real samples keeps absolute thresholds.
 - `delivered_reads` and `modal_dev_bp` are `absolute_only`: 15,000 reads is a deliverable floor, and `modal_dev_bp` is already relative to the run.
 - Samples with fewer than `min_reads_for_stats` (200) raw demultiplexed reads get `NA (n<200)` in every metric except `delivered_reads`, which is still flagged.
-- Controls (`Sample_Type` NTC / BLANK / POS_CTRL) are reported with flag `CTRL` and left out of every run median.
+- Controls (`Sample_Type` NTC / BLANK / POS_CTRL) are reported with flag `CTRL` and left out of every run median. A control with an empty `Client` or `Client = ALL` is shared: it appears in every per-client report and TSV. A control with a named client goes only to that client. (The pipeline itself skips rows with an empty `Client`, so such a control has no delivered reads; use `ALL` if it should be delivered.)
+- Flags are always run-based: run medians, relative-mode thresholds and the modal-length median come from all real samples of the run. Per-client reports only filter rows, so a sample has the same flag in every report.
 
 Reason codes list every non-pass metric, worst first, e.g. `FAIL: LOW_CORE(48%);LONG(22%)`; relative-mode entries carry their z (`PRIMER(30%,z=17.8)`). Codes: `READS`, `PRIMER`, `LONG`, `LOW_CORE`, `MODAL`.
 
@@ -428,9 +431,10 @@ Reason codes list every non-pass metric, worst first, e.g. `FAIL: LOW_CORE(48%);
 
 | File | Contents |
 |---|---|
-| `qc_report.html` | **Main review view.** One self-contained file (data embedded as JSON, inline JS/CSS, no external libraries or network). Header with filter stage, config version, flag counts and run-level flags; filter by client / flag / sample name and sort by any column; length and Q heatmaps side by side (hover for details); click a row for that sample's length and Q histograms against the run median, each metric's PASS / CHECK / FAIL badge and threshold, reasons and Comment; sortable table of all samples. Written with the standard library only, so it is produced even without matplotlib |
+| `qc_report.html` | **Main review view** (internal, all samples). One self-contained file (data embedded as JSON, inline JS/CSS, no external libraries or network). Header with filter stage, config version, flag counts and run-level flags; filter by client / flag / sample name and sort by any column; length and Q heatmaps side by side (hover for details); click a row for that sample's length and Q histograms against the run median, each metric's PASS / CHECK / FAIL badge and threshold, reasons and Comment; sortable table of all samples (Comment column in place of Type). Written with the standard library only, so it is produced even without matplotlib |
 | `per_sample_qc.tsv` | One row per sample: client, sample, barcode, type, `raw_demuxed`, every metric, `modal_length`, `median_q` (info), flag, reasons, Comment. `#` header records config version, filter stage and windows |
-| `per_client/<Client>_qc.tsv` | Per-client cut of the same table |
+| `per_client/<Client>_qc.tsv` | Per-client cut of the same table, plus shared controls |
+| `per_client/<Client>_qc_report.html` | Per-client cut of `qc_report.html` (same layout and interactivity) for sending to the client; see "Client-safe HTML" above. File names use the Sample_ID sanitising rule (`[^A-Za-z0-9_-]` -> `_`) |
 | `run_qc.txt` | Config version, filter stage, windows, run-level flags and medians, flag counts, `unk` / `Multiple_Matches` share, warnings |
 | `qc_bins.tsv.gz` | Long format (sample, kind, bin, count); kind `len` (50 bp, all reads), `q` (in-window reads), `q_all` -- for re-plotting / re-thresholding |
 | `length_heatmap.png`, `q_heatmap.png` | Static copies for email / records. Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised. Length axis 1–4 kb shows the > 2 kb tail, core window shaded, dashed lines at 1,000 and 2,000 bp; the Q heatmap is informational and has no threshold line. Flag strip on the left, flagged rows labelled. Split per client above 384 rows |

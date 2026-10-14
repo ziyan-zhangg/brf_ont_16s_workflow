@@ -13,6 +13,7 @@ plot checks are skipped.
 Run:  python tests/test_qc_report.py
 """
 import contextlib
+import getpass
 import gzip
 import importlib.util
 import io
@@ -25,6 +26,11 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Must never appear in an HTML report: facility paths, project, username
+# (the username only when long enough not to match by accident).
+INTERNAL = ("/g/data", "/scratch", "/home", "vz35",
+            *([getpass.getuser()] if len(getpass.getuser()) >= 4 else []))
 
 sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location("qc_report", ROOT / "qc_report.py")
@@ -55,9 +61,17 @@ DESIGN = {
     "BP_primer": [(300, 1500, Q40)],                   # 70% primer found
     "NTC1": [(20, 1500, Q40)],
     "Tiny": [(100, 1500, Q40)],                        # n < 200
+    "POS_B": [(300, 1500, Q40)],                       # ClientB's own control
     "unk": [(50, 1500, Q10)],
 }
 SAMPLES = [s for s in DESIGN if s != "unk"]
+# Sample sheet: ClientB owns BP_core, ITS and the control POS_B; NTC1 has no
+# client, so it is a shared control; everything else is ClientA.
+CLIENT = {s: "ClientA" for s in SAMPLES} | {
+    "BP_core": "ClientB", "ITS": "ClientB", "POS_B": "ClientB", "NTC1": ""}
+TYPE = {"NTC1": "NTC", "POS_B": "POS_CTRL"}
+COMMENT = {"Tiny": "low DNA input", "ITS": "clientB private note"}
+BARCODE = {s: f"TBC{i + 1:03d}" for i, s in enumerate(SAMPLES)}
 PASS1 = {s: 97.0 for s in SAMPLES} | {"BP_primer": 70.0}
 DELIVERED = {s: 20000 for s in SAMPLES} | {"NTC1": 40, "Tiny": 100}
 
@@ -134,8 +148,8 @@ def build_run(tmp: Path, name: str, stage: str, long_name=None) -> Path:
 
 def write_sheet(path: Path) -> None:
     path.write_text("Client,Sample_ID,Location,Barcode,Sample_Type,Comment\n" + "".join(
-        f"ClientA,{s},A{i + 1},TBC{i + 1:03d},{'NTC' if s == 'NTC1' else ''},"
-        f"{'low DNA input' if s == 'Tiny' else ''}\n"
+        f"{CLIENT[s]},{s},A{i + 1},{BARCODE[s]},{TYPE.get(s, '')},"
+        f"{COMMENT.get(s, '')}\n"
         for i, s in enumerate(SAMPLES)))
 
 
@@ -335,7 +349,7 @@ def main() -> int:
     run_report(leak, sheet, config=leak_cfg)
     lpage = (leak / "qc_report" / "qc_report.html").read_text(encoding="utf-8")
     flat = lpage.replace("\\\\", "/").replace("\\", "/")
-    found = [s for s in ("/g/data", "/scratch", "/home", "vz35") if s in flat]
+    found = [s for s in INTERNAL if s in flat]
     lblob = html_blob(leak / "qc_report" / "qc_report.html")
     check(not found and "output_dir" not in lblob["run"]
           and lblob["run"]["name"] == "ONT_16S_LEAK"
@@ -353,6 +367,52 @@ def main() -> int:
           and '{ key: "type", label: "Type"' not in lpage,
           "sample table shows Comment instead of Type",
           "sample table columns not as expected")
+
+    for f in sorted((leak / "qc_report" / "per_client").glob("*.html")):
+        fp = f.read_text(encoding="utf-8").replace("\\\\", "/").replace("\\", "/")
+        found = [s for s in INTERNAL if s in fp]
+        check(not found, f"{f.name} has no facility paths",
+              f"{f.name} leaks {found}")
+
+    # ---- 2e. per-client reports --------------------------------------------
+    pc = qd / "per_client"
+    run_flags = {s["id"]: s["flag"] for s in html_blob(qd / "qc_report.html")["samples"]}
+    check(sorted(p.name for p in pc.glob("*.html"))
+          == ["ClientA_qc_report.html", "ClientB_qc_report.html"],
+          "per_client/<Client>_qc_report.html for each client, none for "
+          "shared controls", f"per-client HTML: {sorted(p.name for p in pc.glob('*'))}")
+    for me, other in (("ClientA", "ClientB"), ("ClientB", "ClientA")):
+        path = pc / f"{me}_qc_report.html"
+        page = path.read_text(encoding="utf-8")
+        blob = html_blob(path)
+        ids = {s["id"] for s in blob["samples"]}
+        mine = {s for s in SAMPLES if CLIENT[s] == me} | {"NTC1"}
+        theirs = [s for s in SAMPLES if CLIENT[s] == other]
+        leaked = [x for x in (other, *(f'"{s}"' for s in theirs),
+                              *(BARCODE[s] for s in theirs),
+                              *(COMMENT[s] for s in theirs if s in COMMENT))
+                  if x in page]
+        check(ids == mine and not leaked,
+              f"{me} report: all {me} samples + shared control, nothing of {other}",
+              f"{me} report: ids {sorted(ids)} (want {sorted(mine)}), leaked {leaked}")
+        diff = {s["id"]: (s["flag"], run_flags[s["id"]]) for s in blob["samples"]
+                if s["flag"] != run_flags[s["id"]]}
+        counts = blob["run"]["flag_counts"]
+        check(not diff and sum(counts.values()) == len(mine)
+              and counts["CTRL"] == len({"NTC1", "POS_B"} & mine)
+              and blob["run"]["client"] == me and not blob["run"]["warnings"]
+              and not blob["run"]["catch_all"],
+              f"{me} report: flags identical to the run report, counts "
+              f"recomputed ({counts}), no warnings / catch-all",
+              f"{me} report: flag diffs {diff}, counts {counts}, run {blob['run']}")
+    check((pc / "ClientA_qc.tsv").is_file() and "NTC1" in table(pc / "ClientA_qc.tsv")
+          and "POS_B" not in table(pc / "ClientA_qc.tsv"),
+          "per-client TSV: shared control included, other client's control not",
+          f"ClientA_qc.tsv rows: {sorted(table(pc / 'ClientA_qc.tsv'))}")
+    tp = (qd / "per_sample_qc.tsv")
+    check(table(tp)["NTC1"]["client"] == "" and table(tp)["NTC1"]["flag"] == "CTRL",
+          "control with empty Client kept in the run table as CTRL",
+          f"NTC1 row: {table(tp).get('NTC1')}")
 
     # ---- 3. pre mode -------------------------------------------------------
     out_pre = build_run(tmp, "run_pre", "pre")

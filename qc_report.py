@@ -228,14 +228,15 @@ def load_samplesheet(path: Path, control_types: list[str]) -> list[SheetSample]:
         for i, row in enumerate(reader, start=2):
             client = (row.get("Client") or "").strip()
             sid = (row.get("Sample_ID") or "").strip()
-            if not client or not sid:
-                continue
             stype = (row.get("Sample_Type") or "").strip().upper() or "SAMPLE"
+            # A control may leave Client empty: it is shared by every client.
+            if not sid or (not client and stype not in control_types):
+                continue
             if stype not in allowed:
                 sys.exit(f"ERROR: {path} line {i}: Sample_Type {stype!r} is not "
                          f"one of {', '.join(sorted(allowed))}")
             out.append(SheetSample(
-                client=core.sanitise(client),
+                client=core.sanitise(client) if client else "",
                 sample_id=core.sanitise_sample_id(sid),
                 barcode=(row.get("Barcode") or "").strip(),
                 location=(row.get("Location") or "").strip(),
@@ -246,6 +247,26 @@ def load_samplesheet(path: Path, control_types: list[str]) -> list[SheetSample]:
     if not out:
         sys.exit(f"ERROR: no samples found in {path}")
     return out
+
+
+# Client values that mark a control as shared by every client.
+SHARED_CLIENTS = {"", "ALL"}
+
+
+def is_shared(s: SheetSample, control_types: list[str]) -> bool:
+    """A control with an empty Client or Client = ALL goes into every
+    per-client report; a control with a named client only into that one."""
+    return s.sample_type in control_types and s.client.upper() in SHARED_CLIENTS
+
+
+def report_clients(sheet: list[SheetSample], control_types: list[str]) -> list[str]:
+    """Clients that get a per-client report: every client of a non-shared row."""
+    return sorted({s.client for s in sheet if not is_shared(s, control_types)})
+
+
+def client_file_stem(client: str) -> str:
+    """Client name for file names; same rule as Sample_ID sanitising."""
+    return core.sanitise_sample_id(client)
 
 
 # =============================================================================
@@ -896,11 +917,21 @@ def _json_num(v: float | None) -> float | int | None:
 
 
 def html_data(args: argparse.Namespace, cfg: dict[str, Any], ev: Evaluation,
-              profiles: dict[str, DemuxProfile],
-              warnings: list[str]) -> dict[str, Any]:
+              profiles: dict[str, DemuxProfile], warnings: list[str],
+              client: str | None = None) -> dict[str, Any]:
+    """Data for qc_report.html. With client, only that client's samples and
+    the shared controls are embedded, and anything naming other samples
+    (warnings, catch-all counts) is left out, so the page can be sent to the
+    client. Flags, run medians and the run-median overlay always come from
+    the whole run, so a sample has the same flag in every report."""
     f, cw, rl = cfg["filter"], cfg["core_window"], cfg["run_level"]
-    controls = set(cfg["controls"]["types"])
+    control_types = cfg["controls"]["types"]
+    controls = set(control_types)
     by_metric = {mr.metric: mr for mr in ev.runs}
+    shown = [r for r in ev.results
+             if client is None or r.sample.client == client
+             or is_shared(r.sample, control_types)]
+    shown_ids = {id(r) for r in shown}
 
     metrics = []
     for m in METRICS:
@@ -917,10 +948,13 @@ def html_data(args: argparse.Namespace, cfg: dict[str, Any], ev: Evaluation,
         s, prof = r.sample, profiles.get(r.sample.sample_id)
         lc, qc_ = _plot_counts(prof, "len"), _plot_counts(prof, "q")
         if s.sample_type not in controls:
-            real_len.append(lc)
+            real_len.append(lc)        # whole run: an anonymous aggregate
             real_q.append(qc_)
+        if id(r) not in shown_ids:
+            continue
         samples.append({
             "id": s.sample_id, "client": s.client, "barcode": s.barcode,
+            "shared": is_shared(s, control_types),
             "location": s.location, "type": s.sample_type,
             "comment": s.comment, "order": s.order,
             "flag": r.flag, "reasons": r.reasons, "n": r.n,
@@ -931,27 +965,32 @@ def html_data(args: argparse.Namespace, cfg: dict[str, Any], ev: Evaluation,
             "len": lc, "q": qc_,
         })
 
-    total = sum(p.reads for p in profiles.values())
+    # Internal only: warnings name samples, catch-all bins are run-wide.
     catch_all = []
-    for sid in CATCH_ALL:
-        n = profiles[sid].reads if sid in profiles else 0
-        catch_all.append({"sample": sid, "reads": n,
-                          "share": 100.0 * n / total if total else 0.0})
+    if client is None:
+        total = sum(p.reads for p in profiles.values())
+        for sid in CATCH_ALL:
+            n = profiles[sid].reads if sid in profiles else 0
+            catch_all.append({"sample": sid, "reads": n,
+                              "share": 100.0 * n / total if total else 0.0})
 
     len_edges, q_edges = _edges("len"), _edges("q")
     return {
         "run": {
-            # Run name only: no output_dir or other facility paths, the
-            # page may be sent to clients.
+            # Run name only: no output_dir or other facility paths, every
+            # HTML page may end up with a client.
             "name": args.output_dir.resolve().name,
+            "client": client,
             "generated": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
             "config_version": config_label(cfg),
             "filter_stage": ev.filter_stage,
             "filter_stage_note": _stage_note(ev.filter_stage),
-            "flag_counts": {fl: sum(r.flag == fl for r in ev.results)
+            "flag_counts": {fl: sum(r.flag == fl for r in shown)
                             for fl in ("PASS", "CHECK", "FAIL", "CTRL")},
+            # Anonymous text, e.g. "RUN: LONG (median 18%, FAIL) -> ...".
             "run_flags": run_flag_lines(ev.runs),
-            "warnings": [_client_safe(w) for w in warnings],
+            "warnings": ([_client_safe(w) for w in warnings]
+                         if client is None else []),
             "catch_all": catch_all,
             "core_window": {"min": cw["min"], "max": cw["max"]},
             "delivered": {"min": f["minknow_min_len"],
@@ -980,10 +1019,12 @@ def write_html(path: Path, data: dict[str, Any]) -> None:
         sys.exit(f"ERROR: HTML template not found: {HTML_TEMPLATE} -- it must "
                  f"sit beside qc_report.py")
     # '<' escaped so no string in the data (a sample Comment, say) can close
-    # the <script> element early; < is still valid JSON.
+    # the <script> element early; the JSON unicode escape is still valid JSON.
     blob = json.dumps(data, ensure_ascii=False, allow_nan=False,
                       separators=(",", ":")).replace("<", "\\u003c")
-    title = html.escape(f"16S QC report - {data['run']['name']}")
+    client = data["run"]["client"]
+    title = html.escape(f"16S QC report - {data['run']['name']}"
+                        + (f" - {client}" if client else ""))
     page = (HTML_TEMPLATE.read_text(encoding="utf-8")
             .replace("__TITLE__", title)
             .replace("__QC_DATA__", blob))
@@ -1296,14 +1337,25 @@ def main(argv: list[str] | None = None) -> int:
     client_dir = qc_dir / "per_client"
     if client_dir.is_dir():
         shutil.rmtree(client_dir)
-    for client in sorted({r.sample.client for r in ev.results}):
-        write_sample_tsv(client_dir / f"{client}_qc.tsv",
-                         [r for r in ev.results if r.sample.client == client],
+    control_types = cfg["controls"]["types"]
+    clients = report_clients(sheet, control_types)
+    stems = {c: client_file_stem(c) for c in clients}
+    clash = sorted(c for c in clients if list(stems.values()).count(stems[c]) > 1)
+    if clash:
+        warnings.append(f"clients {', '.join(clash)} share a per-client file "
+                        f"name after sanitising; only the last one is kept")
+    for client in clients:
+        write_sample_tsv(client_dir / f"{stems[client]}_qc.tsv",
+                         [r for r in ev.results if r.sample.client == client
+                          or is_shared(r.sample, control_types)],
                          header)
     write_bins(qc_dir / "qc_bins.tsv.gz", profiles)
     write_plots(qc_dir, ev, profiles, cfg, warnings, args.png_drilldown)
     write_html(qc_dir / "qc_report.html",
                html_data(args, cfg, ev, profiles, warnings))
+    for client in clients:
+        write_html(client_dir / f"{stems[client]}_qc_report.html",
+                   html_data(args, cfg, ev, profiles, warnings, client=client))
     write_run_qc(qc_dir / "run_qc.txt", args, cfg, counts, ev, profiles,
                  warnings)
 
