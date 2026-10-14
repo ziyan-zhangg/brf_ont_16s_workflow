@@ -314,6 +314,7 @@ Two summary files are written:
 | File | Contents |
 |------|----------|
 | `integrated_demultiplexing/<Client>/summary.txt` | Per-sample read counts for that client; flags samples below 15,000 reads |
+| `integrated_demultiplexing/<Client>/<Client>_qc_report.html` | Client-safe per-sample QC report, written by `qc_report.py` (see "Per-sample QC report") |
 | `read_counts_summary.txt` | Run-level totals plus the per-stage read-count breakdown below |
 
 `read_counts_summary.txt` now tracks the read count through every stage, so the two-stage loss is separable:
@@ -380,7 +381,7 @@ minibar_output/ONT_16S_TBC_<date>/
 
 **Read quality is not flagged.** Every delivered read already passed MinKNOW Q15, and Q20 is an unreasonable bar for ONT 16S. The Q distribution is still shown (heatmap and drill-down), and `median_q` is reported, for information only.
 
-The main output is **`qc_report/qc_report.html`**: a single self-contained page (no network access needed -- open it from Gadi, a shared drive or an email attachment) with the run summary, interactive length and Q heatmaps, a click-to-drill-down view per sample and a sortable table. `per_client/<Client>_qc_report.html` is the same page cut to one client, for sending to that client.
+The main output is **`qc_report/qc_report.html`**: a single self-contained page (no network access needed -- open it from Gadi, a shared drive or an email attachment) with the run summary, interactive length and Q heatmaps, a click-to-drill-down view per sample and a sortable table. `integrated_demultiplexing/<Client>/<Client>_qc_report.html` is the same page cut to one client; it sits in the client's delivery folder so it ships with the reads.
 
 **Client-safe HTML.** No HTML report contains internal paths or identifiers (no `/g/data`, `/scratch`, `/home`, `vz35`, usernames, sample-sheet or config paths); the config is identified by version and short hash, and paths in warnings are cut to file names. A per-client report contains nothing about other clients -- no sample IDs, barcodes, comments or client names, not even in the embedded data. Its header counts are recomputed for that client; run-level flags appear only as anonymous text (e.g. `RUN: LONG (median 18%, FAIL)`), the drill-down's run-median line is an anonymous aggregate, and warnings and catch-all bin counts are left out.
 
@@ -434,7 +435,7 @@ Reason codes list every non-pass metric, worst first, e.g. `FAIL: LOW_CORE(48%);
 | `qc_report.html` | **Main review view** (internal, all samples). One self-contained file (data embedded as JSON, inline JS/CSS, no external libraries or network). Header with filter stage, config version, flag counts and run-level flags; filter by client / flag / sample name and sort by any column; length and Q heatmaps side by side (hover for details); click a row for that sample's length and Q histograms against the run median, each metric's PASS / CHECK / FAIL badge and threshold, reasons and Comment; sortable table of all samples (Comment column in place of Type). Written with the standard library only, so it is produced even without matplotlib |
 | `per_sample_qc.tsv` | One row per sample: client, sample, barcode, type, `raw_demuxed`, every metric, `modal_length`, `median_q` (info), flag, reasons, Comment. `#` header records config version, filter stage and windows |
 | `per_client/<Client>_qc.tsv` | Per-client cut of the same table, plus shared controls |
-| `per_client/<Client>_qc_report.html` | Per-client cut of `qc_report.html` (same layout and interactivity) for sending to the client; see "Client-safe HTML" above. File names use the Sample_ID sanitising rule (`[^A-Za-z0-9_-]` -> `_`) |
+| `../integrated_demultiplexing/<Client>/<Client>_qc_report.html` | Per-client cut of `qc_report.html` (same layout and interactivity), written into the client's delivery folder next to its reads and `summary.txt`; see "Client-safe HTML" above. File names use the Sample_ID sanitising rule (`[^A-Za-z0-9_-]` -> `_`). If the run dir has no `integrated_demultiplexing/`, it goes to `qc_report/per_client/` with a warning |
 | `run_qc.txt` | Config version, filter stage, windows, run-level flags and medians, flag counts, `unk` / `Multiple_Matches` share, warnings |
 | `qc_bins.tsv.gz` | Long format (sample, kind, bin, count); kind `len` (50 bp, all reads), `q` (in-window reads), `q_all` -- for re-plotting / re-thresholding |
 | `length_heatmap.png`, `q_heatmap.png` | Static copies for email / records. Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised. Length axis 1–4 kb shows the > 2 kb tail, core window shaded, dashed lines at 1,000 and 2,000 bp; the Q heatmap is informational and has no threshold line. Flag strip on the left, flagged rows labelled. Split per client above 384 rows |

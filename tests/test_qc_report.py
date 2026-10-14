@@ -368,21 +368,41 @@ def main() -> int:
           "sample table shows Comment instead of Type",
           "sample table columns not as expected")
 
-    for f in sorted((leak / "qc_report" / "per_client").glob("*.html")):
+    leak_pages = sorted((leak / "integrated_demultiplexing").glob("*/*.html"))
+    check(len(leak_pages) == 2, "per-client HTML present in the leak run",
+          f"leak run per-client HTML: {leak_pages}")
+    for f in leak_pages:
         fp = f.read_text(encoding="utf-8").replace("\\\\", "/").replace("\\", "/")
         found = [s for s in INTERNAL if s in fp]
         check(not found, f"{f.name} has no facility paths",
               f"{f.name} leaks {found}")
 
+    # No integrated_demultiplexing/: per-client HTML falls back to per_client/.
+    integ_l = leak / "integrated_demultiplexing"
+    integ_l.rename(leak / "moved_away")
+    try:
+        run_report(leak, sheet)
+        fb = sorted(p.name for p in (leak / "qc_report" / "per_client").glob("*.html"))
+        rq = (leak / "qc_report" / "run_qc.txt").read_text()
+    finally:
+        (leak / "moved_away").rename(integ_l)
+    check(fb == ["ClientA_qc_report.html", "ClientB_qc_report.html"]
+          and "written to qc_report/per_client/ instead" in rq,
+          "no integrated_demultiplexing/: per-client HTML in per_client/, with a warning",
+          f"fallback: {fb}")
+
     # ---- 2e. per-client reports --------------------------------------------
     pc = qd / "per_client"
+    integ = out / "integrated_demultiplexing"
     run_flags = {s["id"]: s["flag"] for s in html_blob(qd / "qc_report.html")["samples"]}
-    check(sorted(p.name for p in pc.glob("*.html"))
-          == ["ClientA_qc_report.html", "ClientB_qc_report.html"],
-          "per_client/<Client>_qc_report.html for each client, none for "
-          "shared controls", f"per-client HTML: {sorted(p.name for p in pc.glob('*'))}")
+    placed = sorted(p.relative_to(integ).as_posix() for p in integ.glob("*/*.html"))
+    check(placed == ["ClientA/ClientA_qc_report.html", "ClientB/ClientB_qc_report.html"]
+          and not list(pc.glob("*.html")) and not list(integ.glob("*.html")),
+          "<Client>_qc_report.html written into integrated_demultiplexing/<Client>/, "
+          "none for shared controls, none left in per_client/",
+          f"per-client HTML: {placed}, per_client/: {sorted(p.name for p in pc.glob('*'))}")
     for me, other in (("ClientA", "ClientB"), ("ClientB", "ClientA")):
-        path = pc / f"{me}_qc_report.html"
+        path = integ / me / f"{me}_qc_report.html"
         page = path.read_text(encoding="utf-8")
         blob = html_blob(path)
         ids = {s["id"] for s in blob["samples"]}

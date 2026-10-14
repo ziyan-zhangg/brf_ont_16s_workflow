@@ -1353,8 +1353,18 @@ def main(argv: list[str] | None = None) -> int:
     write_plots(qc_dir, ev, profiles, cfg, warnings, args.png_drilldown)
     write_html(qc_dir / "qc_report.html",
                html_data(args, cfg, ev, profiles, warnings))
+    # Per-client HTML goes into the client's delivery folder (the folder name
+    # is the sanitised client, as organise_by_client made it), so it ships
+    # with the reads. Without integrated_demultiplexing/ it stays in
+    # per_client/.
+    integ = args.output_dir / "integrated_demultiplexing"
+    if clients and not integ.is_dir():
+        warnings.append(f"no {integ.name}/ in the run dir; per-client HTML "
+                        f"reports written to qc_report/per_client/ instead")
     for client in clients:
-        write_html(client_dir / f"{stems[client]}_qc_report.html",
+        dest = integ / client if integ.is_dir() else client_dir
+        dest.mkdir(parents=True, exist_ok=True)
+        write_html(dest / f"{stems[client]}_qc_report.html",
                    html_data(args, cfg, ev, profiles, warnings, client=client))
     write_run_qc(qc_dir / "run_qc.txt", args, cfg, counts, ev, profiles,
                  warnings)
@@ -1367,6 +1377,10 @@ def main(argv: list[str] | None = None) -> int:
     if warnings:
         log(f" {len(warnings)} warning(s); see run_qc.txt")
     log(f" Report: {qc_dir / 'qc_report.html'}")
+    if clients:
+        where = ("integrated_demultiplexing/<Client>/" if integ.is_dir()
+                 else "qc_report/per_client/")
+        log(f" Per-client reports ({len(clients)}): {where}<Client>_qc_report.html")
     log(f" QC report complete: {datetime.now():%Y-%m-%d %H:%M:%S}")
     log("========================================")
     return 0
