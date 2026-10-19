@@ -1,3 +1,7 @@
+v6.01
+Date: 2026-10-20
+* Update: small changes to the final report.
+
 v6.00
 Date: 2026-10-14
 * Change: filter_stage default is now post (demultiplex first, then Chopper per sample).

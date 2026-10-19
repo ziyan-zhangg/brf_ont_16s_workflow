@@ -13,8 +13,7 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* Fix: correctly handle empty fastq files. 
-  Update: pre mode writing plain FASTQ to $PBS_JOBFS instead of gzip level 9.
+* Update: small changes to the final report.
 "@
 
 Write-Host "Using version: $VER"

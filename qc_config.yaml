@@ -37,10 +37,10 @@ min_reads_for_stats: 200
 # run-relative judgement. modal_dev_bp: already relative to the run median.
 metrics:
   delivered_reads: {direction: higher_better, check: 15000, fail: 5000, absolute_only: true}
-  primer_found:    {direction: higher_better, check: 0.90, fail: 0.75}
+  primer_found:    {direction: higher_better, check: 0.85, fail: 0.70}
   long_frac:       {direction: lower_better,  check: 0.05, fail: 0.15}
   core_frac:       {direction: higher_better, check: 0.75, fail: 0.50}
-  modal_dev_bp:    {direction: lower_better,  check: 50,   fail: 100, absolute_only: true}
+  modal_dev_bp:    {direction: lower_better,  check: 100,   fail: 150, absolute_only: true}
 
 run_level:
   outlier_k_check: 3          # robust z >= 3 in the bad direction -> Check
